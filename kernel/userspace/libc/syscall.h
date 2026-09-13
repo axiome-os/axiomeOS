@@ -66,6 +66,7 @@ long sys_fork(void);
 long sys_spawn_cmd(const char *cmdline, size_t len);
 int execve(const char *path, char *const argv[], char *const envp[]);
 long sys_waitpid(int pid, int *status);
+long sys_waitpid_nb(int pid, int *status);
 int sys_ps(void *buf, int max);
 void sys_exit(int code);
 long sys_yield(void);

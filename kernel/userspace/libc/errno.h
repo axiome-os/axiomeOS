@@ -15,6 +15,8 @@ extern int errno;
 #define ENOTDIR 20
 #define EISDIR 21
 #define EBADF  9
+#define ECHILD 10
+#define EAGAIN 11
 #define EIO    5
 
 /* perror - print error message to stderr */

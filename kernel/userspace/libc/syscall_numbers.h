@@ -104,6 +104,10 @@
 #define SYS_DNS_RESOLVE   68   /* dns_resolve(name, ip_out) */
 #define SYS_PING          69   /* ping(dst_be32, timeout_ms, *rtt_us) */
 
-#define __SYS_LAST        70   /* one past the highest number */
+/* ---- non-blocking child reap for compositors (axwm polls this per frame)
+   instead of stalling on a blocking waitpid) ---- */
+#define SYS_WAITPID_NB    70   /* waitpid_nb(pid, *status): pid, -ECHILD, -EAGAIN */
+
+#define __SYS_LAST        71   /* one past the highest number */
 
 #endif

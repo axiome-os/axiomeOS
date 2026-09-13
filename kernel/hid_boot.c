@@ -1,5 +1,6 @@
 #include "keyboard.h"
 #include "tty.h"
+#include "input.h"
 
 static uint8_t previous[6];
 
@@ -64,7 +65,11 @@ void keyboard_hid_boot_report(uint8_t modifiers, const uint8_t keys[6])
         if (key && !key_present(previous, key)) {
             int c = hid_key(key, shift);
             if (c)
-                tty_input_char(c);
+            {
+                input_push_key((uint32_t)c);
+                if (!input_gui_grabbed())
+                    tty_input_char(c);
+            }
         }
     }
     for (int i = 0; i < 6; i++)

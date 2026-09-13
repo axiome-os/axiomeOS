@@ -87,6 +87,10 @@ void GopDisplay::fill_rect(const GfxRect &r, uint32_t rgb)
         for (uint32_t x = 0; x < c.w; x++)
             row[x] = native;
     }
+    /* The pixels above landed directly in the staging buffer, bypassing the
+       console's dirty tracking: mark the rect so present() flushes it. */
+    fb_mark_dirty(c.x, c.y, c.w, c.h);
+    fb_flush();
     /* Mark via a 1px glyph? No: framebuffer.c owns dirty tracking. The
        flush below covers it because we dirty the whole rect through the
        back-buffer path is internal. Simplest correct step: full present.
@@ -116,6 +120,7 @@ void GopDisplay::blit(const GfxRect &dst, const uint32_t *src,
         for (uint32_t x = 0; x < c.w; x++)
             drow[x] = canonical_to_native(srow[x], cur_.format);
     }
+    fb_mark_dirty(c.x, c.y, c.w, c.h);
     fb_flush();
     __asm__ volatile("sfence" ::: "memory");
 }

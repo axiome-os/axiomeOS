@@ -2,6 +2,7 @@
 #include "printk.h"
 #include "tty.h"
 #include "io.h"
+#include "input.h"
 #include "hal/cshim.h"
 
 #define KEYBOARD_IRQ 1
@@ -35,6 +36,54 @@ static int esc_state = ESC_STATE_IDLE;
 static int esc_buf[4];
 static int esc_idx = 0;
 
+/* PS/2 set-1 shift state + extended (0xE0) prefix. Releases arrive with
+   bit 7 set; the GUI input queue only reports presses. */
+static int kbd_shift;
+static int kbd_e0;
+
+/* Route one decoded key: always into the GUI input queue, and into the TTY
+   line discipline only while no desktop holds the grab. */
+static void kbd_emit(int c)
+{
+    input_push_key((uint32_t)c);
+    if (!input_gui_grabbed())
+        tty_input_char(c);
+}
+
+/* Shifted symbol for a scancode whose unshifted char is `base`. Letters are
+   uppercased by the caller; this covers digits and punctuation. */
+static char kbd_shifted(uint8_t sc, char base)
+{
+    switch (sc)
+    {
+        case 0x02: return '!';
+        case 0x03: return '@';
+        case 0x04: return '#';
+        case 0x05: return '$';
+        case 0x06: return '%';
+        case 0x07: return '^';
+        case 0x08: return '&';
+        case 0x09: return '*';
+        case 0x0A: return '(';
+        case 0x0B: return ')';
+        case 0x0C: return '_';
+        case 0x0D: return '+';
+        case 0x1A: return '{';
+        case 0x1B: return '}';
+        case 0x27: return ':';
+        case 0x28: return '"';
+        case 0x29: return '~';
+        case 0x2B: return '|';
+        case 0x33: return '<';
+        case 0x34: return '>';
+        case 0x35: return '?';
+        default: break;
+    }
+    if (base >= 'a' && base <= 'z')
+        return (char)(base - 'a' + 'A');
+    return base;
+}
+
 static void handle_escape(int c)
 {
     switch (esc_state) {
@@ -43,7 +92,7 @@ static void handle_escape(int c)
             esc_state = ESC_STATE_ESC;
             esc_idx = 0;
         } else {
-            tty_input_char(c);
+            kbd_emit(c);
         }
         break;
         
@@ -53,8 +102,8 @@ static void handle_escape(int c)
             esc_idx = 0;
         } else {
             esc_state = ESC_STATE_IDLE;
-            tty_input_char(27);
-            if (c >= 32 && c < 127) tty_input_char(c);
+            kbd_emit(27);
+            if (c >= 32 && c < 127) kbd_emit(c);
         }
         break;
         
@@ -63,42 +112,42 @@ static void handle_escape(int c)
             esc_buf[esc_idx++] = c;
             if (esc_idx >= 4) {
                 esc_state = ESC_STATE_IDLE;
-                tty_input_char(27);
+                kbd_emit(27);
             }
         } else if (c >= 'A' && c <= 'D') {
             /* Arrow keys: [A, [B, [C, [D */
             esc_state = ESC_STATE_IDLE;
-            if (c == 'A') tty_input_char(TTY_KEY_UP);
-            else if (c == 'B') tty_input_char(TTY_KEY_DOWN);
-            else if (c == 'C') tty_input_char(TTY_KEY_RIGHT);
-            else if (c == 'D') tty_input_char(TTY_KEY_LEFT);
+            if (c == 'A') kbd_emit(TTY_KEY_UP);
+            else if (c == 'B') kbd_emit(TTY_KEY_DOWN);
+            else if (c == 'C') kbd_emit(TTY_KEY_RIGHT);
+            else if (c == 'D') kbd_emit(TTY_KEY_LEFT);
         } else if (c == 'H') {
             esc_state = ESC_STATE_IDLE;
-            tty_input_char(TTY_KEY_HOME);
+            kbd_emit(TTY_KEY_HOME);
         } else if (c == 'F') {
             esc_state = ESC_STATE_IDLE;
-            tty_input_char(TTY_KEY_END);
+            kbd_emit(TTY_KEY_END);
         } else if (c == '~') {
             /* Handle [1~, [3~, [4~, etc */
             esc_state = ESC_STATE_IDLE;
             if (esc_idx == 1 && esc_buf[0] == '1') {
-                tty_input_char(TTY_KEY_HOME);
+                kbd_emit(TTY_KEY_HOME);
             } else if (esc_idx == 1 && esc_buf[0] == '3') {
-                tty_input_char(TTY_KEY_DELETE);
+                kbd_emit(TTY_KEY_DELETE);
             } else if (esc_idx == 1 && esc_buf[0] == '4') {
-                tty_input_char(TTY_KEY_END);
+                kbd_emit(TTY_KEY_END);
             } else if (esc_idx == 1 && esc_buf[0] == '5') {
-                tty_input_char(TTY_KEY_PGUP);
+                kbd_emit(TTY_KEY_PGUP);
             } else if (esc_idx == 1 && esc_buf[0] == '6') {
-                tty_input_char(TTY_KEY_PGDN);
+                kbd_emit(TTY_KEY_PGDN);
             }
         } else {
             esc_state = ESC_STATE_IDLE;
-            tty_input_char(27);
-            tty_input_char('[');
+            kbd_emit(27);
+            kbd_emit('[');
             for (int i = 0; i < esc_idx; i++)
-                tty_input_char(esc_buf[i]);
-            if (c >= 32 && c < 127) tty_input_char((char)c);
+                kbd_emit(esc_buf[i]);
+            if (c >= 32 && c < 127) kbd_emit((char)c);
         }
         break;
     }
@@ -110,9 +159,51 @@ void keyboard_irq_handler(void)
     if (status & 1)
     {
         uint8_t scancode = inb(0x60);
+        /* Extended prefix: the next byte is an E0 code. */
+        if (scancode == 0xE0)
+        {
+            kbd_e0 = 1;
+            return;
+        }
+        /* Releases only update modifier state (GUI queue is press-only). */
+        if (scancode & 0x80)
+        {
+            uint8_t rel = (uint8_t)(scancode & 0x7F);
+            if (!kbd_e0 && (rel == 0x2A || rel == 0x36))
+                kbd_shift = 0;
+            kbd_e0 = 0;
+            return;
+        }
+        if (kbd_e0)
+        {
+            kbd_e0 = 0;
+            switch (scancode)
+            {
+                case 0x48: kbd_emit(TTY_KEY_UP); break;
+                case 0x50: kbd_emit(TTY_KEY_DOWN); break;
+                case 0x4B: kbd_emit(TTY_KEY_LEFT); break;
+                case 0x4D: kbd_emit(TTY_KEY_RIGHT); break;
+                case 0x47: kbd_emit(TTY_KEY_HOME); break;
+                case 0x4F: kbd_emit(TTY_KEY_END); break;
+                case 0x49: kbd_emit(TTY_KEY_PGUP); break;
+                case 0x51: kbd_emit(TTY_KEY_PGDN); break;
+                case 0x52: kbd_emit(TTY_KEY_INSERT); break;
+                case 0x53: kbd_emit(TTY_KEY_DELETE); break;
+                default: break;
+            }
+            return;
+        }
+        /* Modifier presses. */
+        if (scancode == 0x2A || scancode == 0x36)
+        {
+            kbd_shift = 1;
+            return;
+        }
         if (scancode < 0x80)
         {
             char c = scancode_ansi[scancode];
+            if (c && kbd_shift)
+                c = kbd_shifted(scancode, c);
             if (c) {
                 /* Handle escape sequences in the keyboard driver */
                 if (c == 27) {
@@ -121,7 +212,7 @@ void keyboard_irq_handler(void)
                 } else if (esc_state != ESC_STATE_IDLE) {
                     handle_escape(c);
                 } else {
-                    tty_input_char(c);
+                    kbd_emit(c);
                 }
             }
         }

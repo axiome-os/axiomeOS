@@ -16,9 +16,26 @@ void tty_input_char(int c)
         emit[emit_count++] = c;
 }
 
+/* Host stubs for the GUI input queue (kernel/input.c): the HID path must
+   mirror every key into the queue in addition to the TTY. */
+static int in_emit[128];
+static int in_emit_count;
+
+void input_push_key(uint32_t code)
+{
+    if (in_emit_count < (int)(sizeof(in_emit) / sizeof(in_emit[0])))
+        in_emit[in_emit_count++] = (int)code;
+}
+
+int input_gui_grabbed(void)
+{
+    return 0;
+}
+
 static void reset_emit(void)
 {
     emit_count = 0;
+    in_emit_count = 0;
 }
 
 /* Send an empty report so the previous-key tracking in hid_boot.c resets. */
@@ -40,6 +57,9 @@ static int test_hid_boot(void)
     keyboard_hid_boot_report(0, keys);
     CHECK_EQ(emit_count, 1);
     CHECK_EQ(emit[0], 'a');
+    /* GUI input queue mirrors the TTY while ungrabbed. */
+    CHECK_EQ(in_emit_count, 1);
+    CHECK_EQ(in_emit[0], 'a');
 
     /* Same key held -> no repeat (edge-triggered). */
     reset_emit();

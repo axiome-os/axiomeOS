@@ -88,6 +88,8 @@ extern const uint64_t role_caps[NROLES];
 #define EINTR    4
 #define EIO      5
 #define EBADF    9
+#define ECHILD   10
+#define EAGAIN   11
 #define ENOMEM   12
 #define EACCES   13
 #define EFAULT   14

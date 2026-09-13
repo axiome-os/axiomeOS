@@ -2,6 +2,7 @@
 #include "font8x16.h"
 #include "arch_mmu.h"
 #include "pmm.h"
+#include "input.h"
 #include <stddef.h>
 
 static struct {
@@ -319,6 +320,12 @@ void fb_putchar(char c)
 {
     if (!fb.present)
         return;
+    /* A GUI desktop owns the screen while the input grab is held: its dumb
+       buffer is the scanout source, so console glyphs would only flicker
+       for one frame before the next PRESENT overwrites them. Stay quiet on
+       the display (serial + klog keep logging). */
+    if (input_gui_grabbed())
+        return;
 
     switch (c)
     {
@@ -426,9 +433,24 @@ void fb_putchar_at(char c, uint32_t x, uint32_t y, uint32_t fg, uint32_t bg)
 {
     if (!fb.present)
         return;
+    if (input_gui_grabbed())
+        return;
     draw_glyph(c, x, y, fg, bg);
     if (fb.back_buffer)
         fb_flush();
     else
         fb_sfence();
+}
+
+void fb_mark_dirty(uint32_t x, uint32_t y, uint32_t w, uint32_t h)
+{
+    if (!fb.present || w == 0 || h == 0)
+        return;
+    if (x >= fb.width || y >= fb.height)
+        return;
+    if (x + w > fb.width)
+        w = fb.width - x;
+    if (y + h > fb.height)
+        h = fb.height - y;
+    mark_dirty(x, y, w, h);
 }

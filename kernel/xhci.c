@@ -482,8 +482,11 @@ static void handle_transfer_event(volatile struct xhci_trb *event)
             if (dev->protocol == 1 && length >= 8)
                 keyboard_hid_boot_report(report[0], &report[2]);
             else if (dev->protocol == 2 && length >= 3)
+                /* USB HID boot-protocol Y is already screen-oriented (+down,
+                   opposite of PS/2's Cartesian +up): pass it through as-is
+                   so the queue stays +right/+down like the PS/2 path. */
                 mouse_submit_event((int)(int8_t)report[1],
-                                   -(int)(int8_t)report[2], report[0] & 7);
+                                   (int)(int8_t)report[2], report[0] & 7);
         }
         queue_interrupt(dev);
         return;

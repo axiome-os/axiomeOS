@@ -79,6 +79,15 @@ $(ROOT_AXFS): $(BUILD_DIR)/kernel/mkfs_axiomefs root_manifest.txt $(MANIFEST_BIN
 #   * partition 1: axiomefs "ROOT" (LBA 131072) populated from root_manifest.txt
 # The disk image is only zeroed/partitioned when missing or when mkpart.py
 # changed; existing partitions are overlaid into it only when they changed.
+#
+# Staleness is tracked with per-partition stamp files (build/.stamp-boot,
+# build/.stamp-root), NOT with disk.img's mtime: every QEMU run bumps the
+# image mtime through guest writes (journal, OOBE), which used to make a
+# just-built partition look older than the image and silently skip its
+# overlay forever (stale kernel with new userspace). QEMU never touches the
+# stamps, so a missed overlay self-heals on the next build.
+BOOT_STAMP := $(BUILD_DIR)/.stamp-boot
+ROOT_STAMP := $(BUILD_DIR)/.stamp-root
 $(DISK_PATH): kernel bootloader $(BUILD_DIR)/kernel/mkfs_axiomefs $(BOOT_FAT) $(ROOT_AXFS) tools/mkpart.py
 	@mkdir -p $(BUILD_DIR)
 	@target=$(DISK_PATH); \
@@ -86,20 +95,25 @@ $(DISK_PATH): kernel bootloader $(BUILD_DIR)/kernel/mkfs_axiomefs $(BOOT_FAT) $(
 		printf '%s\n' 'disk.img: creating fresh image + MBR'; \
 		dd if=/dev/zero of="$$target" bs=512 count=$(DISK_SECTORS) 2>/dev/null; \
 		$(PYTHON) tools/mkpart.py "$$target"; \
-		overlay_boot=1; overlay_root=1; \
+		need_boot=1; need_root=1; \
 	else \
-		overlay_boot=0; overlay_root=0; \
+		need_boot=0; need_root=0; \
 	fi; \
-	need_boot=$$overlay_boot; need_root=$$overlay_root; \
-	[ $(BOOT_FAT) -nt "$$target" ] && need_boot=1; \
-	[ $(ROOT_AXFS) -nt "$$target" ] && need_root=1; \
+	if [ ! -f "$(BOOT_STAMP)" ] || [ $(BOOT_FAT) -nt "$(BOOT_STAMP)" ]; then \
+		need_boot=1; \
+	fi; \
+	if [ ! -f "$(ROOT_STAMP)" ] || [ $(ROOT_AXFS) -nt "$(ROOT_STAMP)" ]; then \
+		need_root=1; \
+	fi; \
 	if [ "$$need_boot" -eq 1 ]; then \
 		printf '%s\n' 'disk.img: overlay BOOT partition'; \
 		dd if=$(BOOT_FAT) of="$$target" bs=512 seek=$(BOOT_PART_LBA) conv=notrunc 2>/dev/null; \
+		touch "$(BOOT_STAMP)"; \
 	fi; \
 	if [ "$$need_root" -eq 1 ]; then \
 		printf '%s\n' 'disk.img: overlay ROOT partition'; \
 		dd if=$(ROOT_AXFS) of="$$target" bs=512 seek=$(ROOT_PART_LBA) conv=notrunc 2>/dev/null; \
+		touch "$(ROOT_STAMP)"; \
 	fi; \
 	touch "$$target"
 
@@ -158,7 +172,7 @@ LIBC_TESTS := \
 	$(BUILD_DIR)/tests/libc_time_test \
 	$(BUILD_DIR)/tests/libc_stdio_test
 
-TEST_BINS := $(KERNEL_TESTS) $(LIBC_TESTS) $(BUILD_DIR)/tests/gfx_clip_test $(BUILD_DIR)/tests/axdri_cmd_test
+TEST_BINS := $(KERNEL_TESTS) $(LIBC_TESTS) $(BUILD_DIR)/tests/gfx_clip_test $(BUILD_DIR)/tests/axdri_cmd_test $(BUILD_DIR)/tests/input_abi_test $(BUILD_DIR)/tests/wm_abi_test
 
 .PHONY: test test-hid
 
@@ -177,6 +191,14 @@ $(BUILD_DIR)/tests/gfx_clip_test: tests/gfx_clip_test.c kernel/gfx/gfx_types.h
 $(BUILD_DIR)/tests/axdri_cmd_test: tests/axdri_cmd_test.c kernel/axdri_cmd.h ports/mesa-axiome/axdri.c ports/mesa-axiome/axdri.h
 	@mkdir -p $(@D)
 	$(HOSTCC) $(TEST_CFLAGS) -DAXDRI_HOST_TEST -DAXDRI_KERNEL_HEADERS -I$(REPO_ROOT) $(KERNEL_INC) -o $@ $<
+
+$(BUILD_DIR)/tests/input_abi_test: tests/input_abi_test.c kernel/input_abi.h
+	@mkdir -p $(@D)
+	$(HOSTCC) $(TEST_CFLAGS) $(KERNEL_INC) -o $@ $<
+
+$(BUILD_DIR)/tests/wm_abi_test: tests/wm_abi_test.c kernel/wm_abi.h
+	@mkdir -p $(@D)
+	$(HOSTCC) $(TEST_CFLAGS) $(KERNEL_INC) -o $@ $<
 
 $(BUILD_DIR)/tests/kernel_string_test: tests/kernel_string_test.c kernel/string.c
 	@mkdir -p $(@D)

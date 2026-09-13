@@ -1,6 +1,7 @@
 #include "mouse.h"
 #include "printk.h"
 #include "io.h"
+#include "input.h"
 #include "hal/cshim.h"
 #include "spinlock.h"
 
@@ -50,6 +51,9 @@ static uint8_t aux_read(void)
 
 void mouse_submit_event(int dx, int dy, uint8_t buttons)
 {
+    /* Always mirror into the GUI input queue (in addition to the legacy
+       polled buffer) so axwm/axterm see PS/2 and USB mice uniformly. */
+    input_push_mouse(dx, dy, (uint32_t)(buttons & 7));
     unsigned long flags = spin_lock_irq(&evlock);
     int next = (evhead + 1) % MOUSE_EVENT_BUF;
     if (next != evtail)
@@ -66,6 +70,9 @@ static void mouse_process_packet(void)
 {
     if ((mouse_packet[0] & 0x08) == 0 || (mouse_packet[0] & 0xc0) != 0)
         return;
+    /* PS/2 motion bytes are Cartesian (+up), the screen is not: negate Y so
+       the queue carries screen-oriented deltas (+right, +down). Verified
+       against QEMU's PS/2 emulation (monitor mouse_move 0 25 -> dy=+25). */
     mouse_submit_event((int)(int8_t)mouse_packet[1],
                        -(int)(int8_t)mouse_packet[2], mouse_packet[0] & 7);
 }

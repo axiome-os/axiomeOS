@@ -134,6 +134,10 @@ long sys_waitpid(int pid, int *status)
 {
     return syscall(SYS_WAITPID, (long)pid, (long)status, 0, 0, 0, 0);
 }
+long sys_waitpid_nb(int pid, int *status)
+{
+    return syscall(SYS_WAITPID_NB, (long)pid, (long)status, 0, 0, 0, 0);
+}
 int sys_ps(void *buf, int max)
 {
     return (int)syscall(SYS_PS, (long)buf, (long)max, 0, 0, 0, 0);

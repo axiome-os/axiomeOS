@@ -15,6 +15,7 @@
 #include "sched.h"
 #include "axdri_cmd.h"
 #include "gfx/manager.h"
+#include "framebuffer.h"
 #include <stddef.h>
 #include <stdint.h>
 
@@ -156,6 +157,9 @@ static long dri_cmd_present(struct axdri_cmd *c)
         for (uint32_t x = 0; x < w; x++)
             drow[x] = srow[x];
     }
+    /* Direct staging-buffer write: dirty the rect so the flush below copies
+       it to scanout (without this PRESENT is silently invisible). */
+    fb_mark_dirty(dx, dy, w, h);
     gfx_present();
     return (long)AXDRI_CMD_SIZE;
 }

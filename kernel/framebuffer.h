@@ -23,6 +23,13 @@ void fb_set_cursor(uint32_t x, uint32_t y);
 void fb_get_cursor(uint32_t *x, uint32_t *y);
 void fb_putchar_at(char c, uint32_t x, uint32_t y, uint32_t fg, uint32_t bg);
 
+/* Mark a pixel rectangle dirty so the next fb_flush()/gfx_present() copies
+   it to scanout. Direct pixel writers that bypass fb_putchar (the gfx
+   backends, DRI PRESENT) must call this after scribbling on the staging
+   buffer; otherwise the flush sees a clean flag and the pixels stay
+   invisible. Coordinates are clamped to the live mode. */
+void fb_mark_dirty(uint32_t x, uint32_t y, uint32_t w, uint32_t h);
+
 uint32_t fb_width(void);
 uint32_t fb_height(void);
 uint32_t fb_pitch(void);

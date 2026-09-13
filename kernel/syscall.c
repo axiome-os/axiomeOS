@@ -204,6 +204,39 @@ static uint64_t sys_waitpid(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, 
     }
 }
 
+/* Non-blocking reap for event loops (the axwm compositor polls this every
+   frame): exactly one zombie check, never suspends. Returns the reaped pid,
+   -ECHILD when no children remain, or -EAGAIN when children exist but none
+   has exited yet. */
+static uint64_t sys_waitpid_nb(uint64_t a1, uint64_t a2, uint64_t a3,
+                               uint64_t a4, uint64_t a5)
+{
+    (void)a3; (void)a4; (void)a5;
+    int pid_filter = (int)a1;
+    int *status_out = (int *)a2;
+    struct thread *t = sched_current();
+    int self_pid = t ? t->pid : 0;
+
+    if (status_out && !user_range_ok((uint64_t)status_out, sizeof(int), 1))
+        return (uint64_t)-EFAULT;
+
+    {
+        struct thread *z = sched_child_zombie(self_pid, pid_filter);
+        if (z)
+        {
+            int st = z->exit_status;
+            int zpid = z->pid;
+            sched_reap_zombie(z);
+            if (status_out)
+                *status_out = st;
+            return (uint64_t)zpid;
+        }
+    }
+    if (!sched_has_child(self_pid))
+        return (uint64_t)(-ECHILD);
+    return (uint64_t)(-EAGAIN);
+}
+
 static void con_putchar(char c)
 {
     if (fb_active())
@@ -2149,6 +2182,8 @@ static syscall_fn syscall_table[] = {
     [SYS_STAT]          = sys_stat,
     [SYS_RMDIR]         = sys_rmdir,
     [SYS_AUTHENTICATE]  = sys_authenticate,
+    /* non-blocking reap for compositors */
+    [SYS_WAITPID_NB]    = sys_waitpid_nb,
 };
 
 /* ABI guard (issue #33): the table must cover every number defined in the
