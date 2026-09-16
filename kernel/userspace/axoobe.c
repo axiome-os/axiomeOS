@@ -20,8 +20,7 @@
 #define USERS_DIR   "/Users"
 
 #define BTN_CREATE 1
-#define BTN_CANCEL 2
-#define BTN_ADMIN  3
+#define BTN_ADMIN  2
 
 static int valid_username(const char *s)
 {
@@ -230,9 +229,6 @@ int main(int argc, char **argv)
         b = axform_add_button(&form, "Create", BTN_CREATE, 0);
         form.buttons[b].x = 24;  form.buttons[b].y = 258;
         form.buttons[b].w = 110; form.buttons[b].h = FONT_HEIGHT + 10;
-        b = axform_add_button(&form, "Cancel", BTN_CANCEL, 0);
-        form.buttons[b].x = 146; form.buttons[b].y = 258;
-        form.buttons[b].w = 110; form.buttons[b].h = FONT_HEIGHT + 10;
     }
 
     axclient_begin(&cx);
@@ -270,10 +266,6 @@ int main(int argc, char **argv)
                         axclient_commit(&cx);
                         return 0;
                     }
-                }
-                else if (id == BTN_CANCEL)
-                {
-                    return 1;
                 }
             }
             prev_btn = ev.code;

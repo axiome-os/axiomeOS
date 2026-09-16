@@ -45,13 +45,6 @@ static void info_draw(struct axgui_fb *fb)
     axgui_text(fb, line, 8, y, INFO_FG, INFO_BG);
     y += FONT_HEIGHT + 4;
 
-    axgui_text(fb, "axinfo is a real /Binaries program hosted", 8, y,
-               INFO_DM, INFO_BG);
-    y += FONT_HEIGHT;
-    axgui_text(fb, "by guixd (pixels via SHM, keys via pipe).", 8, y,
-               INFO_DM, INFO_BG);
-    y += FONT_HEIGHT + 4;
-
     axgui_text(fb, "press any key to close", 8, y, INFO_HD, INFO_BG);
 }
 

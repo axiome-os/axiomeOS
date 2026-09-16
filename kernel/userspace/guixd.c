@@ -71,6 +71,8 @@ struct win {
     int last_mx, last_my;   /* last mouse state forwarded */
     uint32_t last_btn;
     uint32_t seq;           /* last seqlock seq fully blitted (repaint trigger) */
+    int fullscreen;         /* fill entire screen, no title bar/border/close */
+    int noclose;            /* cannot be closed via X button */
 };
 
 static struct win g_wins[WM_MAX_WIN];
@@ -132,12 +134,23 @@ static void cursor_restore(struct axgui_fb *fb)
         }
 }
 
+static int has_fullscreen(void)
+{
+    int i;
+    for (i = 0; i < (int)WM_MAX_WIN; i++)
+        if (g_wins[i].used && !g_wins[i].dead && g_wins[i].fullscreen)
+            return 1;
+    return 0;
+}
+
 static struct win *win_at(int x, int y)
 {
     int i;
     for (i = g_nz - 1; i >= 0; i--)
     {
         struct win *w = &g_wins[g_z[i]];
+        if (!w->dead && w->fullscreen) return w;
+        if (w->dead && w->fullscreen) continue;
         if (x >= w->x && x < w->x + (int)WIN_FW && y >= w->y &&
             y < w->y + (int)WIN_FH)
             return w;
@@ -194,7 +207,7 @@ static void win_elect_focus(void)
    expiry, silent free for requested closes, dead frame for crashes). */
 static void win_request_close(struct win *w, long now)
 {
-    if (!w->used || w->dead || w->pid <= 0)
+    if (!w->used || w->dead || w->pid <= 0 || w->noclose)
         return;
     if (w->hdr)
         w->hdr->closed = 1;
@@ -229,6 +242,8 @@ static void win_free_slot(struct win *w)
     w->closing = 0;
     w->dead = 0;
     w->dragging = 0;
+    w->fullscreen = 0;
+    w->noclose = 0;
     w->chain_login = 0;
     w->is_login = 0;
     if (g_drag_win == (int)(w - g_wins))
@@ -387,8 +402,21 @@ static struct win *open_client(const char *title, const char *prog,
     if (!w)
         return 0;
     w->used = 1;
-    w->x = 60 + (g_nz % 4) * 28;
-    w->y = TOPBAR + 30 + (g_nz % 4) * 24;
+    if (strcmp(prog, "axoobe") == 0 || strcmp(prog, "axlogin") == 0)
+    {
+        w->fullscreen = 1;
+        w->noclose = 1;
+    }
+    if (w->fullscreen)
+    {
+        w->x = ((int)fb->w - (int)WM_WIN_W) / 2;
+        w->y = ((int)fb->h - (int)WM_WIN_H) / 2;
+    }
+    else
+    {
+        w->x = 60 + (g_nz % 4) * 28;
+        w->y = TOPBAR + 30 + (g_nz % 4) * 24;
+    }
     if (w->x + (int)WIN_FW > (int)fb->w - 8)
         w->x = (int)fb->w - 8 - (int)WIN_FW;
     if (w->x < 0)
@@ -585,6 +613,8 @@ static struct win *win_reopen_session(struct win *w, long uid, long gid,
     w->status = 0;
     w->chain_login = 0;
     w->is_login = 0;
+    w->fullscreen = 0;
+    w->noclose = 0;
     if (!open_client_in(w, "Terminal", "axterm", 0, uid, gid, fb))
     {
         w->dead = 1;
@@ -713,9 +743,11 @@ static int handle_click(int x, int y, struct axgui_fb *fb, int input_fd,
     {
         struct win *w = win_at(x, y);
         int xbtn = 0;
+        int fullscreen;
         if (!w || !w->used)
             return 0;
-        xbtn = (x >= w->x + (int)WIN_FW - TITLEBAR &&
+        fullscreen = w->fullscreen;
+        xbtn = !fullscreen && (x >= w->x + (int)WIN_FW - TITLEBAR &&
                 x < w->x + (int)WIN_FW - 4 && y >= w->y + 3 &&
                 y < w->y + TITLEBAR - 3);
         if (w->dead)
@@ -733,7 +765,7 @@ static int handle_click(int x, int y, struct axgui_fb *fb, int input_fd,
             win_request_close(w, now);
             return 1;
         }
-        if (y >= w->y && y < w->y + TITLEBAR)
+        if (!fullscreen && y >= w->y && y < w->y + TITLEBAR)
         {
             w->dragging = 1;
             w->drag_ox = x - w->x;
@@ -742,8 +774,17 @@ static int handle_click(int x, int y, struct axgui_fb *fb, int input_fd,
         }
         if (!w->closing && w->pid > 0 && w->evfd >= 0)
         {
-            int lx = x - (w->x + FRAME_X);
-            int ly = y - (w->y + FRAME_TOP);
+            int lx, ly;
+            if (fullscreen)
+            {
+                lx = x - w->x;
+                ly = y - w->y;
+            }
+            else
+            {
+                lx = x - (w->x + FRAME_X);
+                ly = y - (w->y + FRAME_TOP);
+            }
             if (lx >= 0 && ly >= 0 && lx < (int)WM_WIN_W &&
                 ly < (int)WM_WIN_H)
             {
@@ -822,7 +863,52 @@ static void render(struct axgui_fb *fb)
     for (i = 0; i < g_nz; i++)
     {
         struct win *w = &g_wins[g_z[i]];
+        if (w->dead && w->fullscreen)
+            continue;
         uint32_t tc = w->focused ? D_TitleF : D_Title;
+        if (w->fullscreen && !w->dead)
+        {
+            int cx = ((int)fb->w - (int)WM_WIN_W) / 2;
+            int cy = ((int)fb->h - (int)WM_WIN_H) / 2;
+            uint32_t *src;
+            uint32_t s0, s1;
+            int r, c;
+            axgui_fill(fb, 0, 0, (int)fb->w, (int)fb->h, D_WinBG);
+            if (w->hdr && w->hdr->ready && !w->dead)
+            {
+                s0 = w->hdr->seq;
+                if (!(s0 & 1u))
+                {
+                    src = (uint32_t *)((uint8_t *)w->hdr + WM_HDR_SIZE);
+                    for (r = 0; r < (int)WM_WIN_H; r++)
+                    {
+                        uint32_t *drow =
+                            &fb->px[(size_t)(cy + r) * (fb->pitch / 4) + (size_t)(cx)];
+                        uint32_t *srow = &src[(size_t)r * WM_WIN_W];
+                        for (c = 0; c < (int)WM_WIN_W; c++)
+                        {
+                            if (cx + c < 0 || cx + c >= (int)fb->w ||
+                                cy + r < 0 || cy + r >= (int)fb->h)
+                                continue;
+                            drow[c] = srow[c];
+                        }
+                    }
+                    __sync_synchronize();
+                    s1 = w->hdr->seq;
+                    if (s0 == s1)
+                        w->seq = s0;
+                }
+            }
+            else
+            {
+                char note[64];
+                axgui_fill(fb, cx, cy, (int)WM_WIN_W, (int)WM_WIN_H,
+                           D_WinBG);
+                snprintf(note, sizeof(note), "starting ...");
+                axgui_text(fb, note, cx + 8, cy + 8, D_Dim, D_WinBG);
+            }
+            continue;
+        }
         axgui_fill(fb, w->x, w->y, (int)WIN_FW, (int)WIN_FH, D_WinBG);
         axgui_fill(fb, w->x, w->y, (int)WIN_FW, TITLEBAR, tc);
         axgui_rect(fb, w->x, w->y, (int)WIN_FW, (int)WIN_FH, D_Accent);
@@ -854,25 +940,27 @@ static void render(struct axgui_fb *fb)
         }
     }
 
-    axgui_fill(fb, 0, 0, (int)fb->w, TOPBAR, D_BAR);
-    axgui_fill(fb, 4, 3, 92, 18, g_menu ? D_Accent : D_Title);
-    axgui_text(fb, "axiome", 12, 4, D_FG, g_menu ? D_Accent : D_Title);
+    if (!has_fullscreen())
     {
-        long now = (long)time(0);
-        int hh, mm, ss;
-        if (now < 0)
-            now = 0;
-        ss = (int)((now % 60 + 60) % 60);
-        mm = (int)(((now / 60) % 60 + 60) % 60);
-        hh = (int)(((now / 3600) % 24 + 24) % 24);
-        snprintf(clock, sizeof(clock), "%02d:%02d:%02d UTC", hh, mm, ss);
+        axgui_fill(fb, 0, 0, (int)fb->w, TOPBAR, D_BAR);
+        axgui_fill(fb, 4, 3, 92, 18, g_menu ? D_Accent : D_Title);
+        axgui_text(fb, "axiome", 12, 4, D_FG, g_menu ? D_Accent : D_Title);
+        {
+            long now = (long)time(0);
+            int hh, mm, ss;
+            if (now < 0)
+                now = 0;
+            ss = (int)((now % 60 + 60) % 60);
+            mm = (int)(((now / 60) % 60 + 60) % 60);
+            hh = (int)(((now / 3600) % 24 + 24) % 24);
+            snprintf(clock, sizeof(clock), "%02d:%02d:%02d UTC", hh, mm, ss);
+        }
+        axgui_text(fb, clock,
+                   (int)fb->w / 2 - axgui_text_width(clock) / 2, 4, D_FG, D_BAR);
+        axgui_fill(fb, (int)fb->w - 120, 3, 56, 18, D_Title);
+        axgui_text(fb, "+Term", (int)fb->w - 112, 4, D_FG, D_Title);
     }
-    axgui_text(fb, clock,
-               (int)fb->w / 2 - axgui_text_width(clock) / 2, 4, D_FG, D_BAR);
-    axgui_fill(fb, (int)fb->w - 120, 3, 56, 18, D_Title);
-    axgui_text(fb, "+Term", (int)fb->w - 112, 4, D_FG, D_Title);
-
-    if (g_menu)
+    if (!has_fullscreen() && g_menu)
     {
         int mh = (7 + g_napps + 1) * FONT_HEIGHT + 8;
         int my = TOPBAR + 2;
@@ -1108,8 +1196,17 @@ int main(int argc, char **argv)
             if (hit && hit->used && !hit->dead && !hit->closing &&
                 hit->pid > 0 && hit->evfd >= 0)
             {
-                int lx = g_mx - (hit->x + FRAME_X);
-                int ly = g_my - (hit->y + FRAME_TOP);
+                int lx, ly;
+                if (hit->fullscreen)
+                {
+                    lx = g_mx - hit->x;
+                    ly = g_my - hit->y;
+                }
+                else
+                {
+                    lx = g_mx - (hit->x + FRAME_X);
+                    ly = g_my - (hit->y + FRAME_TOP);
+                }
                 if (lx >= 0 && ly >= 0 && lx < (int)WM_WIN_W &&
                     ly < (int)WM_WIN_H &&
                     (lx != hit->last_mx || ly != hit->last_my ||
@@ -1181,7 +1278,11 @@ int main(int argc, char **argv)
                         w->dead = 0;
                         if (open_client_in(w, "Login", "axlogin", 0, -1,
                                            -1, &fb))
+                        {
                             w->is_login = 1;
+                            w->fullscreen = 1;
+                            w->noclose = 1;
+                        }
                         else
                         {
                             w->dead = 1;
@@ -1318,7 +1419,7 @@ int main(int argc, char **argv)
         }
         /* else: idle — no present, nothing pushed over PCIe. */
 
-        axgui_msleep(50);
+        axgui_msleep(16);
     }
 
     /* The daemon only leaves its loop via a system restart (menu "R

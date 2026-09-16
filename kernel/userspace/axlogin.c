@@ -14,7 +14,6 @@
 #include "axform.h"
 
 #define BTN_LOGIN  1
-#define BTN_CANCEL 2
 
 #define AXLOGIN_RUN_DIR "/var/run"
 
@@ -124,9 +123,6 @@ int main(int argc, char **argv)
         int b = axform_add_button(&form, "Login", BTN_LOGIN, 0);
         form.buttons[b].x = 24;  form.buttons[b].y = 180;
         form.buttons[b].w = 96;  form.buttons[b].h = FONT_HEIGHT + 10;
-        b = axform_add_button(&form, "Cancel", BTN_CANCEL, 0);
-        form.buttons[b].x = 132; form.buttons[b].y = 180;
-        form.buttons[b].w = 96;  form.buttons[b].h = FONT_HEIGHT + 10;
     }
     if (nouser)
         axform_set_status(&form,
@@ -163,10 +159,6 @@ int main(int argc, char **argv)
                             "No user account exists yet: run First-boot setup first.");
                     else if (do_login(&form, &cx))
                         return 0;
-                }
-                else if (id == BTN_CANCEL)
-                {
-                    return 0;
                 }
             }
             prev_btn = ev.code;

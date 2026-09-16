@@ -70,6 +70,12 @@ static int g_drag_win = -1;
 static char g_apps[16][64];
 static int g_napps;
 
+#define CURS_W 16
+#define CURS_H 16
+static uint32_t g_cursor_save[CURS_W * CURS_H];
+static int g_cursor_save_ok;
+static int g_cursor_x = -1, g_cursor_y = -1;
+
 static void win_close_slot(struct win *w);
 
 static struct win *win_at(int x, int y)
@@ -372,6 +378,63 @@ static void blit_content(struct axgui_fb *fb, struct win *w)
     }
 }
 
+static void cursor_snapshot(struct axgui_fb *fb, int x, int y)
+{
+    int r, c;
+    if (x < 0 || y < 0 || x + CURS_W > (int)fb->w || y + CURS_H > (int)fb->h)
+    {
+        g_cursor_save_ok = 0;
+        return;
+    }
+    for (r = 0; r < CURS_H; r++)
+        for (c = 0; c < CURS_W; c++)
+        {
+            int px = x + c, py = y + r;
+            if (px < 0 || py < 0 || px >= (int)fb->w || py >= (int)fb->h)
+                g_cursor_save[(size_t)r * CURS_W + c] = 0;
+            else
+                g_cursor_save[(size_t)r * CURS_W + c] =
+                    fb->px[(size_t)py * (fb->pitch / 4) + (size_t)px];
+        }
+    g_cursor_x = x;
+    g_cursor_y = y;
+    g_cursor_save_ok = 1;
+}
+
+static void cursor_restore(struct axgui_fb *fb)
+{
+    int r, c;
+    if (!g_cursor_save_ok || !fb || !fb->px)
+        return;
+    for (r = 0; r < CURS_H; r++)
+        for (c = 0; c < CURS_W; c++)
+        {
+            int px = g_cursor_x + c, py = g_cursor_y + r;
+            if (px < 0 || py < 0 || px >= (int)fb->w || py >= (int)fb->h)
+                continue;
+            fb->px[(size_t)py * (fb->pitch / 4) + (size_t)px] =
+                g_cursor_save[(size_t)r * CURS_W + c];
+        }
+}
+
+static void redraw_cursor_only(struct axgui_fb *fb)
+{
+    int ux0, uy0, ux1, uy1, uw, uh;
+    cursor_restore(fb);
+    ux0 = g_cursor_x < g_mx ? g_cursor_x : g_mx;
+    uy0 = g_cursor_y < g_my ? g_cursor_y : g_my;
+    ux1 = (g_cursor_x + CURS_W > g_mx + CURS_W ? g_cursor_x + CURS_W
+                                                   : g_mx + CURS_W);
+    uy1 = (g_cursor_y + CURS_H > g_my + CURS_H ? g_cursor_y + CURS_H
+                                                   : g_my + CURS_H);
+    uw = ux1 - ux0;
+    uh = uy1 - uy0;
+    cursor_snapshot(fb, g_mx, g_my);
+    axgui_cursor(fb, g_mx, g_my);
+    if (axgui_present_rect(fb, ux0, uy0, uw, uh) < 0)
+        axgui_present(fb);
+}
+
 static void render(struct axgui_fb *fb, int tick)
 {
     int i, x, y;
@@ -455,7 +518,6 @@ static void render(struct axgui_fb *fb, int tick)
         }
     }
 
-    axgui_cursor(fb, g_mx, g_my);
 }
 
 int main(int argc, char **argv)
@@ -522,6 +584,8 @@ int main(int argc, char **argv)
     for (;;)
     {
         int n = axgui_poll(input_fd, ev, 64);
+        int state_changed = 0;
+        int mouse_moved = 0;
         for (i = 0; i < n; i++)
         {
             if (ev[i].type == AXINPUT_TYPE_MOUSE)
@@ -537,6 +601,7 @@ int main(int argc, char **argv)
                     g_mx = (int)fb.w - 1;
                 if (g_my >= (int)fb.h)
                     g_my = (int)fb.h - 1;
+                mouse_moved = (ev[i].dx || ev[i].dy);
                 g_btn = ev[i].code;
                 /* Forward motion to the window under the pointer. */
                 hit = win_at(g_mx, g_my);
@@ -583,11 +648,15 @@ int main(int argc, char **argv)
                         ke.y = 0;
                         axgui_wm_send(f->evfd, &ke);
                     }
+                    state_changed = 1;
                 }
             }
         }
         if ((g_btn & AXINPUT_BTN_LEFT) && !(g_prev_btn & AXINPUT_BTN_LEFT))
-            handle_click(g_mx, g_my, &fb, input_fd);
+        {
+            if (handle_click(g_mx, g_my, &fb, input_fd))
+                state_changed = 1;
+        }
         if (!(g_btn & AXINPUT_BTN_LEFT) && (g_prev_btn & AXINPUT_BTN_LEFT))
         {
             if (g_drag_win >= 0 && g_drag_win < (int)WM_MAX_WIN)
@@ -609,6 +678,7 @@ int main(int argc, char **argv)
                     w->x = (int)fb.w - 40;
                 if (w->y > (int)fb.h - 40)
                     w->y = (int)fb.h - 40;
+                state_changed = 1;
             }
         }
         g_prev_btn = g_btn;
@@ -639,9 +709,17 @@ int main(int argc, char **argv)
             break;
         if (g_nz == 0)
             open_terminal(0, &fb);
-        render(&fb, tick++);
-        axgui_present(&fb);
-        axgui_msleep(50);
+        if (state_changed || g_cursor_x < 0)
+        {
+            render(&fb, tick++);
+            axgui_present(&fb);
+            cursor_snapshot(&fb, g_mx, g_my);
+        }
+        else if (mouse_moved)
+        {
+            redraw_cursor_only(&fb);
+        }
+        axgui_msleep(16);
     }
 
     for (i = 0; i < (int)WM_MAX_WIN; i++)
