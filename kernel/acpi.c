@@ -1,10 +1,18 @@
 #include "acpi.h"
 #include "printk.h"
 #include "string.h"
+#include "io.h"
 
 static struct acpi_rsdp *g_rsdp;
 static int g_revision;
 static struct acpi_madt *g_madt;
+
+/* Power-control registers, cached from the FACP (SystemIO ports). */
+static uint32_t g_pm1a_cnt;
+static uint32_t g_pm1b_cnt;
+static struct acpi_generic_address g_reset_reg;
+static int g_reset_present;
+static uint8_t g_reset_value;
 
 struct ioapic_info {
     uint64_t addr;
@@ -169,6 +177,103 @@ void acpi_init(void *rsdp_addr)
         printk("ACPI: no IOAPICs found in MADT\n");
     else
         printk("ACPI: %d IOAPIC(s), %d ISO(s)\n", g_ioapic_count, g_iso_count);
+
+    /* Cache the power-control registers from the FACP so sys_reboot /
+       sys_poweroff do not need to re-walk the RSDT. */
+    {
+        struct acpi_fadt *fadt = (struct acpi_fadt *)acpi_find_table("FACP");
+        if (fadt && fadt->header.length >= sizeof(struct acpi_fadt))
+        {
+            g_pm1a_cnt = fadt->pm1a_cnt_blk;
+            g_pm1b_cnt = fadt->pm1b_cnt_blk;
+            if (fadt->reset_reg.address)
+            {
+                g_reset_reg = fadt->reset_reg;
+                g_reset_present = 1;
+                g_reset_value = fadt->reset_value;
+            }
+            printk("ACPI: FACP pm1a_cnt=0x%x pm1b_cnt=0x%x%s\n",
+                   g_pm1a_cnt, g_pm1b_cnt,
+                   g_reset_present ? " reset_reg=yes" : "");
+        }
+        else
+        {
+            printk("ACPI: FACP not found — power-off via ACPI S5 unavailable\n");
+        }
+    }
+}
+
+/* Short I/O pause so the write hits the chipset before we continue. */
+static void acpi_pause(void)
+{
+    for (volatile int i = 0; i < 100000; i++)
+        ;
+}
+
+/* Cold reboot. Tries the ACPI reset register first (needs SCI disabled on
+   most firmware — not necessary for QEMU), then the 8042 keyboard-controller
+   reset pulse and a final null-pointer fault as a last resort. */
+void acpi_reboot(void)
+{
+    printk("ACPI: reboot requested\n");
+
+    if (g_reset_present)
+    {
+        if (g_reset_reg.space_id == 1 && g_reset_reg.address < 0x10000ULL)
+            outb((uint16_t)g_reset_reg.address, g_reset_value);
+        else if (g_reset_reg.space_id == 0 &&
+                 g_reset_reg.address < 0x100000000ULL)
+            *(volatile uint8_t *)(uintptr_t)g_reset_reg.address = g_reset_value;
+        acpi_pause();
+    }
+
+    /* 8042 "pulse reset line" (works on QEMU and most PCs). */
+    outb(0x64, 0xFE);
+    acpi_pause();
+
+    /* Last resort: triple fault via a null write. */
+    *(volatile uint8_t *)0 = 0;
+    for (;;)
+        hal_cpu_halt();
+}
+
+/* Program one PM1x counter register for sleep state S5 (power-off). Per the
+   ACPI spec we write SLP_TYP (bits 10-12, 7 = S5) with SLP_EN (bit 13) clear,
+   then set SLP_EN in a second write; the chipset latches and cuts power. The
+   SLP_TYP value lives in the firmware's _S5 AML, which we do not interpret —
+   QEMU (and most PC firmware) use 7, so this is best-effort on real hardware
+   and exact on QEMU. */
+static void acpi_program_s5(uint16_t port)
+{
+    uint16_t val;
+
+    if (!port)
+        return;
+    val = inw(port);
+    val &= ~(uint16_t)(0x07u << 10);   /* clear SLP_TYP */
+    val |= (uint16_t)((0x07u & 0x07u) << 10);  /* S5 */
+    val &= ~(uint16_t)(1u << 13);      /* clear SLP_EN */
+    outw(port, val);
+    val |= (uint16_t)(1u << 13);       /* set SLP_EN -> go to S5 */
+    outw(port, val);
+}
+
+void acpi_poweroff(void)
+{
+    printk("ACPI: power-off requested\n");
+
+    if (g_pm1a_cnt)
+        acpi_program_s5((uint16_t)g_pm1a_cnt);
+    acpi_pause();
+    if (g_pm1b_cnt)
+        acpi_program_s5((uint16_t)g_pm1b_cnt);
+    acpi_pause();
+
+    /* No ACPI power control (or firmware ignored us): degrade to a reset. */
+    printk("ACPI: S5 unavailable/ignored, resetting instead\n");
+    acpi_reboot();
+    for (;;)
+        hal_cpu_halt();
 }
 
 int acpi_ioapic_count(void) { return g_ioapic_count; }

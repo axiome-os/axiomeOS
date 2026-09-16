@@ -71,6 +71,10 @@ int sys_ps(void *buf, int max);
 void sys_exit(int code);
 long sys_yield(void);
 
+/* ---- system power control (reboot / power-off) ---- */
+void sys_reboot(void);
+void sys_poweroff(void);
+
 int ipc_create(void);
 long ipc_send(int chan, const void *buf, size_t len);
 long ipc_recv(int chan, void *buf, size_t max);

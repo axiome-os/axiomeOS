@@ -34,6 +34,62 @@ struct acpi_madt {
     uint8_t  entries[];
 } __attribute__((packed));
 
+/* 12-byte ACPI Generic Address Structure (registers in the FACP). */
+struct acpi_generic_address {
+    uint8_t  space_id;   /* 0 = SystemMemory, 1 = SystemIO */
+    uint8_t  bit_width;
+    uint8_t  bit_offset;
+    uint8_t  access_size;
+    uint64_t address;
+} __attribute__((packed));
+
+/* FACP fields used for power control. Packed so the pm1_* and reset_reg
+   members land on the offsets ACPI mandates (pm1a_cnt_blk = 64,
+   pm1b_cnt_blk = 68, reset_reg = 116). */
+struct acpi_fadt {
+    struct acpi_sdt_header header;
+    uint32_t firmware_ctrl;
+    uint32_t dsdt;
+    uint8_t  reserved1;
+    uint8_t  preferred_pm_profile;
+    uint16_t sci_int;
+    uint32_t smi_cmd;
+    uint8_t  acpi_enable;
+    uint8_t  acpi_disable;
+    uint8_t  s4bios_req;
+    uint8_t  pstate_cnt;
+    uint32_t pm1a_evt_blk;
+    uint32_t pm1b_evt_blk;
+    uint32_t pm1a_cnt_blk;
+    uint32_t pm1b_cnt_blk;
+    uint32_t pm2_cnt_blk;
+    uint32_t pm_tmr_blk;
+    uint32_t gpe0_blk;
+    uint32_t gpe1_blk;
+    uint8_t  pm1_evt_len;
+    uint8_t  pm1_cnt_len;
+    uint8_t  pm2_cnt_len;
+    uint8_t  pm_tmr_len;
+    uint8_t  gpe0_blk_len;
+    uint8_t  gpe1_blk_len;
+    uint8_t  gpe1_base;
+    uint8_t  cst_cnt;
+    uint16_t p_lvl2_lat;
+    uint16_t p_lvl3_lat;
+    uint16_t flush_size;
+    uint16_t flush_stride;
+    uint8_t  duty_offset;
+    uint8_t  duty_width;
+    uint8_t  day_alrm;
+    uint8_t  mon_alrm;
+    uint8_t  century;
+    uint16_t iapc_boot_arch;
+    uint8_t  reserved2;
+    uint32_t flags;
+    struct acpi_generic_address reset_reg;
+    uint8_t  reset_value;
+} __attribute__((packed));
+
 #define MADT_TYPE_LOCAL_APIC      0
 #define MADT_TYPE_IO_APIC         1
 #define MADT_TYPE_ISO             2
@@ -61,5 +117,11 @@ void acpi_init(void *rsdp_addr);
 int  acpi_ioapic_count(void);
 int  acpi_ioapic_info(int idx, uint64_t *addr, uint32_t *gsi_base);
 int  acpi_iso_lookup(uint8_t irq, uint32_t *gsi, uint16_t *flags);
+
+/* System power control (called from sys_reboot / sys_poweroff). Best-effort
+   on bare metal; reliable on QEMU. acpi_poweroff() falls back to a reset if
+   ACPI S5 hardware is unavailable. */
+void acpi_reboot(void);
+void acpi_poweroff(void);
 
 #endif

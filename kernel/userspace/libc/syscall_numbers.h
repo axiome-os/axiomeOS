@@ -108,6 +108,10 @@
    instead of stalling on a blocking waitpid) ---- */
 #define SYS_WAITPID_NB    70   /* waitpid_nb(pid, *status): pid, -ECHILD, -EAGAIN */
 
-#define __SYS_LAST        71   /* one past the highest number */
+/* ---- system power control (reboot / ACPI S5 power-off) ---- */
+#define SYS_REBOOT        71   /* sys_reboot(): 8042 reset pulse           */
+#define SYS_POWEROFF      72   /* sys_poweroff(): ACPI S5 via PM1a_CNT     */
+
+#define __SYS_LAST        73   /* one past the highest number */
 
 #endif

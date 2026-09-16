@@ -23,6 +23,7 @@
 #include "module.h"
 #include "signal.h"
 #include "idt.h"
+#include "acpi.h"
 
 /* SEEK_* whence constants (must match userspace libc/syscall.h). */
 #define SEEK_SET 0
@@ -235,6 +236,40 @@ static uint64_t sys_waitpid_nb(uint64_t a1, uint64_t a2, uint64_t a3,
     if (!sched_has_child(self_pid))
         return (uint64_t)(-ECHILD);
     return (uint64_t)(-EAGAIN);
+}
+
+/* System power control: reboot / ACPI S5 power-off. Only admin and system
+   processes (uid 0 / OS services) may reset or shut the machine down. */
+static uint64_t sys_power_check(void)
+{
+    struct thread *t = sched_current();
+    if (!t || t->role < ROLE_ADMIN)
+        return (uint64_t)-EPERM;
+    return 0;
+}
+
+static uint64_t sys_reboot(uint64_t a1, uint64_t a2, uint64_t a3,
+                           uint64_t a4, uint64_t a5)
+{
+    (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
+    uint64_t deny = sys_power_check();
+    if (deny)
+        return deny;
+    acpi_reboot();
+    for (;;) /* acpi_reboot never returns */
+        ;
+}
+
+static uint64_t sys_poweroff(uint64_t a1, uint64_t a2, uint64_t a3,
+                             uint64_t a4, uint64_t a5)
+{
+    (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
+    uint64_t deny = sys_power_check();
+    if (deny)
+        return deny;
+    acpi_poweroff();
+    for (;;)
+        ;
 }
 
 static void con_putchar(char c)
@@ -532,6 +567,18 @@ static uint64_t sys_open(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uin
     int flags = (int)a2;
     vfs_ensure_proc();
     struct thread *t = sched_current();
+
+    /* System-only graphics/input devices: only OS daemons (ROLE_SYSTEM,
+       init-spawned services such as the guixd display server) may open the
+       DRI render, framebuffer or GUI input devices directly. Regular users
+       reach the desktop through the display server, never the hardware.
+       The device nodes also carry v_uid=0/v_mode=0 (root-only + SYSTEM
+       bypass in vfs_check_perms), so this string gate is defence in depth. */
+    if (t && t->role != ROLE_SYSTEM &&
+        (strncmp(path, "/Devices/dri", 12) == 0 ||
+         strncmp(path, "/Devices/fb", 11) == 0 ||
+         strncmp(path, "/Devices/input", 14) == 0))
+        return (uint64_t)-EACCES;
 
     struct vnode *n = vfs_lookup(path, t->cwd);
     if (n && n->type == VFS_FIFO)
@@ -1950,8 +1997,11 @@ static uint64_t sys_shm_attach(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a
     uint64_t phys = (uint64_t)g_shm[s].phys;
     for (uint64_t p = 0; p < g_shm[s].pages; p++)
     {
+        /* MMU_SHARED: these frames belong to the segment, not to this
+           process — the exit path must never return them to the PMM
+           (otherwise the next thread stack can land on live pixels). */
         if (vmm_map_page_in(t->mmu, va + p * PAGE_SIZE, phys + p * PAGE_SIZE,
-                             MMU_USER | MMU_WRITE) < 0)
+                             MMU_USER | MMU_WRITE | MMU_SHARED) < 0)
             return (uint64_t)(-1);
     }
     return va;
@@ -2184,6 +2234,9 @@ static syscall_fn syscall_table[] = {
     [SYS_AUTHENTICATE]  = sys_authenticate,
     /* non-blocking reap for compositors */
     [SYS_WAITPID_NB]    = sys_waitpid_nb,
+    /* system power control */
+    [SYS_REBOOT]        = sys_reboot,
+    [SYS_POWEROFF]      = sys_poweroff,
 };
 
 /* ABI guard (issue #33): the table must cover every number defined in the

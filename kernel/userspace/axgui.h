@@ -136,6 +136,45 @@ static int axgui_present(struct axgui_fb *fb)
     return (write(fb->fd, &p, sizeof(p)) == (long)sizeof(p)) ? 0 : -1;
 }
 
+/* Present only a rectangle (same src/dst rect) of the dumb buffer. Keeps a
+   pointer-only cursor move off the full-screen blit path (see guixd.c). */
+static int axgui_present_rect(struct axgui_fb *fb, int x, int y, int w, int h)
+{
+    struct axgui_cmd p;
+    uint32_t ux, uy, uw, uh;
+    if (!fb || fb->fd < 0 || w <= 0 || h <= 0)
+        return -1;
+    if (x < 0) { w += x; x = 0; }
+    if (y < 0) { h += y; y = 0; }
+    if (w <= 0 || h <= 0)
+        return -1;
+    ux = (uint32_t)x;
+    uy = (uint32_t)y;
+    uw = (uint32_t)w;
+    uh = (uint32_t)h;
+    if (ux > fb->w || uy > fb->h)
+        return -1;
+    if (uw > fb->w - ux)
+        uw = fb->w - ux;
+    if (uh > fb->h - uy)
+        uh = fb->h - uy;
+    if (uw == 0 || uh == 0)
+        return -1;
+    if (uw > 0xFFFFu)
+        uw = 0xFFFFu;
+    if (uh > 0xFFFFu)
+        uh = 0xFFFFu;
+    p.magic = AXGUI_DRI_MAGIC;
+    p.op = AXGUI_PRESENT;
+    p.args[0] = fb->handle;
+    p.args[1] = (uy << 16) | ux;   /* source = same rect */
+    p.args[2] = (uy << 16) | ux;   /* dest   = same rect */
+    p.args[3] = (uh << 16) | uw;
+    p.args[4] = 0;
+    p.args[5] = 0;
+    return (write(fb->fd, &p, sizeof(p)) == (long)sizeof(p)) ? 0 : -1;
+}
+
 static void axgui_close(struct axgui_fb *fb)
 {
     struct axgui_cmd k;
@@ -423,7 +462,8 @@ static struct wm_win_hdr *axgui_win_attach(long shmid, struct axgui_fb *fb)
     if (!base)
         return 0;
     hdr = (struct wm_win_hdr *)base;
-    if (hdr->magic != WM_MAGIC || hdr->w == 0 || hdr->h == 0)
+    if (hdr->magic != WM_MAGIC || hdr->w == 0 || hdr->h == 0 ||
+        hdr->w > WM_WIN_W || hdr->h > WM_WIN_H)
         return 0;
     fb->fd = -1;
     fb->w = hdr->w;

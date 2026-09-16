@@ -7,7 +7,8 @@
 System/                    0755  0  0  d
 System/Configuration/       0755  0  0  d
 # System/Configuration/passwd: root + guest only. Human users are created at
-# first boot by the CLI OOBE (/bin/oobe), which appends them here.
+# first boot by the desktop setup window (/bin/axoobe); the CLI OOBE
+# (/bin/oobe) remains for manual/headless use and appends them here.
 System/Configuration/passwd 0644  0  0  f  content:root:x:0:0:system:/root:/bin/sh\nguest:x:65534:65534:guest:/Temporary:/sbin/nologin\n
 System/Configuration/axiome-init.conf 0644 0 0 f bin:config/axiome-init.conf
 System/Configuration/journal.log 0644 0 0 f content:
@@ -63,9 +64,12 @@ Binaries/date               0755  0  0  f  bin:kernel/userspace/date.elf
 Binaries/ping               0755  0  0  f  bin:kernel/userspace/ping.elf
 Binaries/gfx_test           0755  0  0  f  bin:kernel/userspace/gfx_test.elf
 Binaries/axwm               0755  0  0  f  bin:kernel/userspace/axwm.elf
+Binaries/guixd               0755  0  0  f  bin:kernel/userspace/guixd.elf
 Binaries/axterm             0755  0  0  f  bin:kernel/userspace/axterm.elf
 Binaries/evtest             0755  0  0  f  bin:kernel/userspace/evtest.elf
 Binaries/axinfo             0755  0  0  f  bin:kernel/userspace/axinfo.elf
+Binaries/axlogin            0755  0  0  f  bin:kernel/userspace/axlogin.elf
+Binaries/axoobe             0755  0  0  f  bin:kernel/userspace/axoobe.elf
 
 # Shared C library, loaded by the kernel's dynamic linker when a binary has a
 # DT_NEEDED entry (see kernel/dynlink.c search paths). Libraries live under

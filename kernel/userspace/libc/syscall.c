@@ -143,6 +143,8 @@ int sys_ps(void *buf, int max)
     return (int)syscall(SYS_PS, (long)buf, (long)max, 0, 0, 0, 0);
 }
 void sys_exit(int code) { syscall(SYS_EXIT, (long)code, 0, 0, 0, 0, 0); }
+void sys_reboot(void) { syscall(SYS_REBOOT, 0, 0, 0, 0, 0, 0); }
+void sys_poweroff(void) { syscall(SYS_POWEROFF, 0, 0, 0, 0, 0, 0); }
 int sys_getpwnam(const char *name, uid_t *uid, gid_t *gid)
 {
     return (int)syscall(SYS_GETPWNAM, (long)name, (long)uid, (long)gid, 0, 0, 0);

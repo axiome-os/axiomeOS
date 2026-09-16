@@ -22,6 +22,12 @@
    UEFI layout). */
 #define X86_PTE_PAT_LARGE (1UL << 12)
 #define X86_PTE_GLOBAL  (1UL << 8)
+/* Bits 9-11 are CPU-available for OS use. Bit 9 marks SHM-shared frames:
+   owned by the SHM segment (not by the mapping process), so free_level
+   must never return them to the PMM while any mapping may reference them.
+   fork's leaf copy masks it off (copies are private), exec/exit then free
+   only the private copies. */
+#define X86_PTE_SHARED  (1UL << 9)
 #define X86_PTE_NX      (1UL << 63)
 
 /* Physical-frame address bits of a page-table entry.  Masks off CPU flag

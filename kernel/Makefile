@@ -42,7 +42,7 @@ ASM_OBJS := $(patsubst %.S, $(BUILD_DIR)/%.o, $(ASM_SRCS))
 USER_PROGS := init hello cat echo sh ls mkdir cp mv rm touch whoami uname \
 	login su chmod chown vfs_test ipc_test proc_test driver_test net_test \
 	kill kxtload kxtunload 	syslogd oobe date burn forkt ping gfx_test \
-	axwm axterm evtest axinfo
+	axwm axterm evtest axinfo guixd axlogin axoobe
 USER_ELFS := $(addprefix userspace/,$(addsuffix .elf,$(USER_PROGS)))
 
 # Every user binary is a PIE that depends on libc.sl (shared library).

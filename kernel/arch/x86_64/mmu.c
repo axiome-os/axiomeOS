@@ -157,6 +157,7 @@ static uint64_t to_x86_flags(uint32_t flags)
     }
     if (flags & MMU_UNCACHED) x |= X86_PTE_PWT | X86_PTE_PCD;
     if (flags & MMU_NX)       x |= X86_PTE_NX;
+    if (flags & MMU_SHARED)   x |= X86_PTE_SHARED;
     return x;
 }
 
@@ -526,6 +527,11 @@ static void free_level(uint64_t *tbl, int level)
         }
         else
         {
+            if (e & X86_PTE_SHARED)
+                continue; /* SHM-owned frame: the segment (not this root)
+                             owns it, so the exit path must never free it.
+                             There is no shm_destroy; segments are immortal,
+                             and fork copies already dropped this bit. */
             pmm_free_frame((void *)(uintptr_t)(e & X86_PTE_ADDR_MASK));
         }
     }

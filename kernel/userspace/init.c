@@ -455,25 +455,11 @@ static void spawn_rescue(void)
     }
 }
 
-/* Run the first-boot wizard (/bin/oobe) before any services start. The wizard
-   is idempotent: it exits immediately once a regular user exists in
-   /etc/passwd, so this is a cheap no-op on every later boot. Failures are
-   logged but never fatal -- the system boots to the console regardless. */
-static void run_firstboot_oobe(void)
-{
-    long pid = sys_spawn_cmd("/bin/oobe", strlen("/bin/oobe"));
-    if (pid < 0)
-    {
-        log_evt("oobe", "bin/oobe unavailable; skipping first-boot setup");
-        return;
-    }
-    int status = 0;
-    sys_waitpid((int)pid, &status);
-    if (status == 0)
-        log_evt("oobe", "first-boot setup finished");
-    else
-        log_evt("oobe", "first-boot setup exited uncleanly (continuing anyway)");
-}
+/* First-boot setup is owned by the desktop: guixd opens the axoobe window
+   when /etc/passwd has no regular user yet. The CLI /bin/oobe stays
+   available for manual/headless use but is deliberately NOT run here, so a
+   fresh boot goes straight to the graphical setup instead of blocking on
+   the serial console. */
 
 /* Load every .kxt under /System/Extensions (loadable kernel modules such as
    the e1000 NIC driver). Best-effort: failures are logged but non-fatal. */
@@ -522,7 +508,6 @@ int main(int argc, char **argv)
     log_evt("init", "axiome-init starting (pid 1)");
 
     load_modules();
-    run_firstboot_oobe();
 
     int n = load_config(INIT_CONF);
     if (n == 0)

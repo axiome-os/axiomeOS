@@ -17,6 +17,10 @@
 #define MMU_GLOBAL   (1u << 4)
 #define MMU_UNCACHED (1u << 5)
 #define MMU_WC       (1u << 6)
+/* Shared frame: owned by whoever shares it (SHM segment), not by this
+   mapping. The exit path never frees it; fork copies drop the mark (the
+   copy is private). Must stay in sync with arch_mmu.h. */
+#define MMU_SHARED   (1u << 7)
 
 #ifdef __cplusplus
 extern "C" {
