@@ -4,11 +4,14 @@
 #include "string.h"
 
 /* ===========================================================================
- * axiome-oobe - first-boot "out of the box" experience.
+ * axiome-oobe - first-boot "out of the box" experience (CLI variant).
  *
- * Runs at every boot (spawned by axiome-init before the services start) but
- * only does the interactive wizard once: it is a no-op as soon as a regular
- * user (role "user" or "admin") exists in /etc/passwd.
+ * Manual/headless use: run /bin/oobe from a console to create the first
+ * user. On a graphical boot the desktop owns first-boot setup instead
+ * (guixd opens the axoobe window when no regular user exists), so
+ * axiome-init no longer spawns this wizard automatically. Either way it
+ * stays idempotent: a no-op as soon as a regular user (role "user" or
+ * "admin") exists in /etc/passwd.
  *
  * The wizard:
  *   * asks for a username, password and confirmation

@@ -1,23 +1,26 @@
-/* axterm — graphical terminal for axiomeOS (/Binaries/axterm).
+/* axterm — terminal emulator for axiomeOS (/Binaries/axterm).
    Two modes:
    * standalone (no args): fullscreen /Devices/dri0 terminal, holds the GUI
-     input grab (like axwm does).
-   * compositor client (`axterm --wm <shmid> <w> <h> <evfd> [-c cmd...]`):
-   *   draws into the axwm window SHM segment and reads wm_events from
-   *   <evfd> (pipe read end inherited across spawn). This is the binary
-   *   axwm launches for its Terminal windows.
-   *
-   * Type commands at the "$ " prompt; Enter runs them with stdout captured
-   * into the scrollback (one-shot commands: ls, cat, uname, ps, ...).
-   * Builtins: help, clear, exit, gui (standalone only), cd, pwd, echo. */
+     input grab while a real /bin/sh session runs underneath.
+   * compositor client (`axterm --wm <shmid> <w> <h> <evfd> [--user <uid> <gid>]
+   *   [-c cmd...]`):
+     draws into the window SHM segment and reads wm_events from <evfd>.
 
-#include "axgui.h"
+   axterm is only a terminal emulator: it spawns /bin/sh with pipes on
+   stdin/stdout/stderr, forwards keystrokes to that shell, parses the shell's
+   output as a VT100-compatible byte stream, and renders the resulting screen.
+   There is no command interpreter here; `exit`, `hello`, pipelines and shell
+   builtins all belong to /bin/sh. */
 
-#define HIST_LINES 256
-#define MAX_COLS 256
-#define IN_MAX 512
-#define CMD_HIST 16
-#define OUT_CAP 8192
+#include "axclient.h"
+#include "errno.h"
+#include "signal.h"
+
+#define TERM_MAX_COLS 256
+#define TERM_MAX_ROWS 64
+#define TERM_CMD_MAX 512
+#define TERM_OUT_CHUNK 512
+#define AXTERM_MAX_FD 32 /* must match kernel MAX_FD in kernel/vfs.h */
 
 /* Palette (canonical 0x00RRGGBB). */
 #define C_BG      0x101418u
@@ -27,400 +30,539 @@
 #define C_ACCENT  0x5E81ACu
 #define C_DIM     0x4C566Au
 
-static char g_lines[HIST_LINES][MAX_COLS + 1];
-static int g_nlines;
-static char g_input[IN_MAX];
-static int g_ilen;
-static int g_cursor;
-static char g_cmdhist[CMD_HIST][IN_MAX];
-static int g_hcount;
-static int g_hpos;
-static char g_cwd[256];
-static int g_wm_mode;
+struct term_state {
+    int cols;
+    int rows;
+    int cx;
+    int cy;
+    int saved_cx;
+    int saved_cy;
+    int esc; /* 0=text, 1=after ESC, 2=CSI, 3=OSC, 4=charset, 5=OSC ESC */
+    int nparams;
+    int params[8];
+    char cells[TERM_MAX_ROWS][TERM_MAX_COLS];
+};
 
-static void term_line(const char *s)
+struct shell_session {
+    long pid;
+    int to_shell;   /* parent/helper write end: shell stdin */
+    int from_shell; /* parent read end: shell stdout/stderr */
+};
+
+static void term_clamp_cursor(struct term_state *t)
 {
-    int i;
-    if (g_nlines >= HIST_LINES)
-    {
-        for (i = 0; i < HIST_LINES - 1; i++)
-            strcpy(g_lines[i], g_lines[i + 1]);
-        g_nlines = HIST_LINES - 1;
-    }
-    strncpy(g_lines[g_nlines], s, MAX_COLS);
-    g_lines[g_nlines][MAX_COLS] = 0;
-    g_nlines++;
+    if (t->cx < 0)
+        t->cx = 0;
+    if (t->cy < 0)
+        t->cy = 0;
+    if (t->cx >= t->cols)
+        t->cx = t->cols - 1;
+    if (t->cy >= t->rows)
+        t->cy = t->rows - 1;
 }
 
-/* Append captured output: split lines, expand tabs, wrap at `cols`. */
-static void term_put(const char *s, int cols)
+static void term_clear(struct term_state *t)
 {
-    char cur[MAX_COLS + 1];
-    int n = 0;
-    if (cols > MAX_COLS)
-        cols = MAX_COLS;
+    int r, c;
+    for (r = 0; r < t->rows; r++)
+        for (c = 0; c < t->cols; c++)
+            t->cells[r][c] = ' ';
+    t->cx = 0;
+    t->cy = 0;
+    t->saved_cx = 0;
+    t->saved_cy = 0;
+    t->esc = 0;
+    t->nparams = 0;
+}
+
+static void term_init(struct term_state *t, int cols, int rows)
+{
+    int r, c;
     if (cols < 8)
         cols = 8;
-    while (*s)
+    if (rows < 4)
+        rows = 4;
+    if (cols > TERM_MAX_COLS)
+        cols = TERM_MAX_COLS;
+    if (rows > TERM_MAX_ROWS)
+        rows = TERM_MAX_ROWS;
+    t->cols = cols;
+    t->rows = rows;
+    for (r = 0; r < TERM_MAX_ROWS; r++)
+        for (c = 0; c < TERM_MAX_COLS; c++)
+            t->cells[r][c] = ' ';
+    term_clear(t);
+}
+
+static void term_scroll(struct term_state *t)
+{
+    int r, c;
+    if (t->rows <= 1)
+        return;
+    for (r = 0; r + 1 < t->rows; r++)
+        for (c = 0; c < t->cols; c++)
+            t->cells[r][c] = t->cells[r + 1][c];
+    for (c = 0; c < t->cols; c++)
+        t->cells[t->rows - 1][c] = ' ';
+}
+
+static void term_line_feed(struct term_state *t)
+{
+    t->cy++;
+    if (t->cy >= t->rows)
     {
-        char c = *s++;
-        if (c == '\r')
-            continue;
-        if (c == '\n')
-        {
-            cur[n] = 0;
-            term_line(cur);
-            n = 0;
-            continue;
-        }
-        if (c == '\t')
-        {
-            do {
-                if (n < cols)
-                    cur[n++] = ' ';
-            } while ((n % 8) && n < cols);
-        }
-        else if ((unsigned char)c >= 32 || (unsigned char)c > 126)
-        {
-            if (n < cols)
-                cur[n++] = c;
-        }
-        if (n >= cols)
-        {
-            cur[n] = 0;
-            term_line(cur);
-            n = 0;
-        }
-    }
-    if (n > 0)
-    {
-        cur[n] = 0;
-        term_line(cur);
+        term_scroll(t);
+        t->cy = t->rows - 1;
     }
 }
 
-static void add_cmdhist(const char *cmd)
+static void term_put(struct term_state *t, char ch)
 {
-    int i;
-    if (!cmd[0])
-        return;
-    if (g_hcount > 0 && strcmp(g_cmdhist[g_hcount - 1], cmd) == 0)
-        return;
-    if (g_hcount < CMD_HIST)
+    if (t->cy < 0 || t->cy >= t->rows)
+        term_clamp_cursor(t);
+    if (t->cx < 0 || t->cx >= t->cols)
+        term_clamp_cursor(t);
+    t->cells[t->cy][t->cx] = ch;
+    t->cx++;
+    if (t->cx >= t->cols)
     {
-        strcpy(g_cmdhist[g_hcount++], cmd);
+        t->cx = 0;
+        term_line_feed(t);
+    }
+}
+
+static int term_param(struct term_state *t, int idx, int def)
+{
+    if (idx < 0 || idx >= t->nparams)
+        return def;
+    if (t->params[idx] == 0)
+        return def;
+    return t->params[idx];
+}
+
+static void term_erase_line(struct term_state *t, int mode)
+{
+    int c;
+    term_clamp_cursor(t);
+    if (mode == 2)
+    {
+        for (c = 0; c < t->cols; c++)
+            t->cells[t->cy][c] = ' ';
+    }
+    else if (mode == 1)
+    {
+        for (c = 0; c <= t->cx; c++)
+            t->cells[t->cy][c] = ' ';
     }
     else
     {
-        for (i = 0; i < CMD_HIST - 1; i++)
-            strcpy(g_cmdhist[i], g_cmdhist[i + 1]);
-        strcpy(g_cmdhist[CMD_HIST - 1], cmd);
+        for (c = t->cx; c < t->cols; c++)
+            t->cells[t->cy][c] = ' ';
     }
-    g_hpos = g_hcount;
 }
 
-static void refresh_cwd(void)
+static void term_erase_display(struct term_state *t, int mode)
 {
-    if (getcwd(g_cwd, sizeof(g_cwd)) != 0)
-        strcpy(g_cwd, "/");
-}
-
-static void do_echo(const char *cmd)
-{
-    const char *p = cmd + 4;
-    while (*p == ' ' || *p == '\t')
-        p++;
-    term_put(p, MAX_COLS);
-}
-
-static void do_help(void)
-{
-    term_put("axterm - graphical terminal (Mesa/dri0 backend)", MAX_COLS);
-    term_put("type any command; output is captured above.", MAX_COLS);
-    term_put("builtins: help clear exit gui cd pwd echo", MAX_COLS);
-}
-
-static void run_external(const char *cmd, int cols)
-{
-    static char out[OUT_CAP];
-    long r = axgui_run_capture(cmd, out, sizeof(out));
-    if (r < 0)
+    int r, c;
+    if (mode == 2 || mode == 3)
     {
-        char msg[IN_MAX + 32];
-        const char *name = cmd;
-        int i = 0;
-        while (name[i] == ' ' || name[i] == '\t')
-            name++;
-        snprintf(msg, sizeof(msg), "axterm: '%s': command not found", name);
-        term_put(msg, cols);
+        term_clear(t);
         return;
     }
-    if (r > 0)
-        term_put(out, cols);
-}
-
-static void exec_line(const char *cmd, int cols, int *exit_req)
-{
-    char word[64];
-    int i = 0;
-    while (cmd[i] == ' ' || cmd[i] == '\t')
-        i++;
+    term_clamp_cursor(t);
+    if (mode == 1)
     {
-        int k = 0;
-        while (cmd[i] && cmd[i] != ' ' && cmd[i] != '\t' && k < 63)
-            word[k++] = cmd[i++];
-        word[k] = 0;
-    }
-    if (word[0] == 0)
-        return;
-    if (strcmp(word, "exit") == 0)
-    {
-        *exit_req = 1;
-    }
-    else if (strcmp(word, "clear") == 0)
-    {
-        g_nlines = 0;
-    }
-    else if (strcmp(word, "help") == 0)
-    {
-        do_help();
-    }
-    else if (strcmp(word, "echo") == 0)
-    {
-        do_echo(cmd);
-    }
-    else if (strcmp(word, "cd") == 0)
-    {
-        const char *p = cmd;
-        while (*p && *p != ' ' && *p != '\t')
-            p++;
-        while (*p == ' ' || *p == '\t')
-            p++;
-        if (!*p)
-            p = "/";
-        if (chdir(p) < 0)
-        {
-            char msg[300];
-            snprintf(msg, sizeof(msg), "cd: %s: no such directory", p);
-            term_put(msg, cols);
-        }
-        else
-        {
-            refresh_cwd();
-        }
-    }
-    else if (strcmp(word, "pwd") == 0)
-    {
-        refresh_cwd();
-        term_put(g_cwd, cols);
-    }
-    else if (strcmp(word, "gui") == 0)
-    {
-        if (g_wm_mode)
-        {
-            term_put("already running under axwm", cols);
-        }
-        else
-        {
-            term_put("starting axwm ...", cols);
-            run_external("/bin/axwm", cols);
-        }
+        for (r = 0; r < t->cy; r++)
+            for (c = 0; c < t->cols; c++)
+                t->cells[r][c] = ' ';
+        for (c = 0; c <= t->cx; c++)
+            t->cells[t->cy][c] = ' ';
     }
     else
     {
-        run_external(cmd, cols);
+        for (c = t->cx; c < t->cols; c++)
+            t->cells[t->cy][c] = ' ';
+        for (r = t->cy + 1; r < t->rows; r++)
+            for (c = 0; c < t->cols; c++)
+                t->cells[r][c] = ' ';
     }
 }
 
-static void handle_key(uint32_t code, int cols, int *exit_req,
-                       int input_fd)
+static void term_handle_csi(struct term_state *t, char final)
 {
-    int i;
-    (void)input_fd;
+    int n, row, col, i;
+    switch (final)
+    {
+    case 'A':
+        n = term_param(t, 0, 1);
+        t->cy -= n;
+        term_clamp_cursor(t);
+        break;
+    case 'B':
+    case 'e':
+        n = term_param(t, 0, 1);
+        t->cy += n;
+        term_clamp_cursor(t);
+        break;
+    case 'C':
+    case 'a':
+        n = term_param(t, 0, 1);
+        t->cx += n;
+        term_clamp_cursor(t);
+        break;
+    case 'D':
+        n = term_param(t, 0, 1);
+        t->cx -= n;
+        term_clamp_cursor(t);
+        break;
+    case 'E':
+        n = term_param(t, 0, 1);
+        t->cx = 0;
+        t->cy += n;
+        term_clamp_cursor(t);
+        break;
+    case 'F':
+        n = term_param(t, 0, 1);
+        t->cx = 0;
+        t->cy -= n;
+        term_clamp_cursor(t);
+        break;
+    case 'G':
+    case '`':
+        col = term_param(t, 0, 1);
+        t->cx = col - 1;
+        term_clamp_cursor(t);
+        break;
+    case 'd':
+        row = term_param(t, 0, 1);
+        t->cy = row - 1;
+        term_clamp_cursor(t);
+        break;
+    case 'H':
+    case 'f':
+        row = term_param(t, 0, 1);
+        col = term_param(t, 1, 1);
+        t->cy = row - 1;
+        t->cx = col - 1;
+        term_clamp_cursor(t);
+        break;
+    case 'J':
+        n = t->nparams > 0 ? t->params[0] : 0;
+        term_erase_display(t, n);
+        break;
+    case 'K':
+        n = t->nparams > 0 ? t->params[0] : 0;
+        term_erase_line(t, n);
+        break;
+    case 'm':
+        /* SGR attributes (colours/bold) are accepted and ignored: this
+           emulator keeps the fixed terminal palette. */
+        break;
+    case 's':
+        t->saved_cx = t->cx;
+        t->saved_cy = t->cy;
+        break;
+    case 'u':
+        t->cx = t->saved_cx;
+        t->cy = t->saved_cy;
+        term_clamp_cursor(t);
+        break;
+    case 'S':
+        n = term_param(t, 0, 1);
+        for (i = 0; i < n; i++)
+            term_scroll(t);
+        break;
+    case 'T':
+        n = term_param(t, 0, 1);
+        for (i = 0; i < n && t->rows > 1; i++)
+        {
+            int r, c;
+            for (r = t->rows - 1; r > 0; r--)
+                for (c = 0; c < t->cols; c++)
+                    t->cells[r][c] = t->cells[r - 1][c];
+            for (c = 0; c < t->cols; c++)
+                t->cells[0][c] = ' ';
+        }
+        break;
+    default:
+        break;
+    }
+}
+
+static void term_feed(struct term_state *t, const char *buf, size_t len)
+{
+    size_t i;
+    if (!t || !buf)
+        return;
+    for (i = 0; i < len; i++)
+    {
+        unsigned char b = (unsigned char)buf[i];
+        if (t->esc == 0)
+        {
+            if (b == 27)
+            {
+                t->esc = 1;
+            }
+            else if (b == '\a' || b == 0)
+            {
+                /* bell and NUL: no visible effect */
+            }
+            else if (b == '\b')
+            {
+                if (t->cx > 0)
+                    t->cx--;
+            }
+            else if (b == '\t')
+            {
+                t->cx = (t->cx + 8) & ~7;
+                if (t->cx >= t->cols)
+                {
+                    t->cx = 0;
+                    term_line_feed(t);
+                }
+            }
+            else if (b == '\n')
+            {
+                /* Match the kernel console: newline means CR+LF. */
+                t->cx = 0;
+                term_line_feed(t);
+            }
+            else if (b == '\r')
+            {
+                t->cx = 0;
+            }
+            else if (b == '\v' || b == '\f')
+            {
+                term_line_feed(t);
+            }
+            else if (b < 32 || b == 127)
+            {
+                /* Other controls (including DEL) are not printable. */
+            }
+            else
+            {
+                term_put(t, (char)b);
+            }
+        }
+        else if (t->esc == 1)
+        {
+            if (b == '[')
+            {
+                t->esc = 2;
+                t->nparams = 0;
+                t->params[0] = 0;
+            }
+            else if (b == ']')
+            {
+                t->esc = 3;
+            }
+            else if (b == '(' || b == ')')
+            {
+                t->esc = 4;
+            }
+            else if (b == '7')
+            {
+                t->saved_cx = t->cx;
+                t->saved_cy = t->cy;
+                t->esc = 0;
+            }
+            else if (b == '8')
+            {
+                t->cx = t->saved_cx;
+                t->cy = t->saved_cy;
+                term_clamp_cursor(t);
+                t->esc = 0;
+            }
+            else if (b == 'M')
+            {
+                if (t->cy > 0)
+                {
+                    t->cy--;
+                }
+                else if (t->rows > 1)
+                {
+                    int r, c;
+                    for (r = t->rows - 1; r > 0; r--)
+                        for (c = 0; c < t->cols; c++)
+                            t->cells[r][c] = t->cells[r - 1][c];
+                    for (c = 0; c < t->cols; c++)
+                        t->cells[0][c] = ' ';
+                }
+                t->esc = 0;
+            }
+            else if (b == 'c')
+            {
+                term_clear(t);
+                t->esc = 0;
+            }
+            else
+            {
+                /* Unknown single-character escape: drop it. */
+                t->esc = 0;
+            }
+        }
+        else if (t->esc == 2)
+        {
+            if (b >= '0' && b <= '9')
+            {
+                if (t->nparams == 0)
+                {
+                    t->nparams = 1;
+                    t->params[0] = 0;
+                }
+                t->params[t->nparams - 1] =
+                    t->params[t->nparams - 1] * 10 + (int)(b - '0');
+                if (t->params[t->nparams - 1] > 9999)
+                    t->params[t->nparams - 1] = 9999;
+            }
+            else if (b == ';')
+            {
+                if (t->nparams == 0)
+                {
+                    t->nparams = 1;
+                    t->params[0] = 0;
+                }
+                if (t->nparams < 8)
+                {
+                    t->params[t->nparams] = 0;
+                    t->nparams++;
+                }
+            }
+            else if (b == '?' || b == ' ' || b == '"' || b == '\'' ||
+                     b == '$')
+            {
+                /* Private/intermediate bytes: accepted, no behaviour. */
+            }
+            else if (b >= '@' && b <= '~')
+            {
+                term_handle_csi(t, (char)b);
+                t->esc = 0;
+            }
+            else
+            {
+                /* Malformed sequence: drop it rather than wedging. */
+                t->esc = 0;
+            }
+        }
+        else if (t->esc == 3)
+        {
+            if (b == '\a')
+                t->esc = 0;
+            else if (b == 27)
+                t->esc = 5;
+        }
+        else if (t->esc == 4)
+        {
+            t->esc = 0;
+        }
+        else if (t->esc == 5)
+        {
+            if (b == '\\')
+                t->esc = 0;
+            else if (b == 27)
+                t->esc = 5;
+            else
+                t->esc = 3;
+        }
+        else
+        {
+            t->esc = 0;
+        }
+    }
+}
+
+static void term_status(struct term_state *t, const char *s)
+{
+    if (!s)
+        return;
+    term_feed(t, s, strlen(s));
+    term_feed(t, "\n", 1);
+}
+
+static void term_draw(struct axgui_fb *fb, struct term_state *t, int x0,
+                      int y0)
+{
+    int r;
+    if (!fb || !fb->px || !t)
+        return;
+    for (r = 0; r < t->rows; r++)
+    {
+        axgui_text_cell(fb, t->cells[r], t->cols, x0,
+                        y0 + r * FONT_HEIGHT, C_FG, C_BG);
+    }
+    if (t->cx >= 0 && t->cx < t->cols && t->cy >= 0 && t->cy < t->rows)
+    {
+        axgui_fill(fb, x0 + t->cx * FONT_WIDTH, y0 + t->cy * FONT_HEIGHT,
+                   FONT_WIDTH, FONT_HEIGHT, C_ACCENT);
+    }
+}
+
+/* Translate one compositor key code into terminal input bytes. Keys the
+   shell cannot use (menu/scroll function keys) produce no bytes instead of
+   injecting garbage into the shell's stdin. */
+static int term_key_bytes(uint32_t code, char *out)
+{
+    if (!out)
+        return 0;
     if (code == '\n' || code == '\r')
     {
-        char prompt[IN_MAX + 8];
-        g_input[g_ilen] = 0;
-        snprintf(prompt, sizeof(prompt), "$ %s", g_input);
-        term_put(prompt, cols);
-        add_cmdhist(g_input);
-        exec_line(g_input, cols, exit_req);
-        g_ilen = 0;
-        g_cursor = 0;
-        g_input[0] = 0;
-        return;
+        out[0] = '\n';
+        return 1;
     }
     if (code == 127 || code == 8)
     {
-        if (g_cursor > 0)
-        {
-            for (i = g_cursor - 1; i < g_ilen - 1; i++)
-                g_input[i] = g_input[i + 1];
-            g_ilen--;
-            g_cursor--;
-            g_input[g_ilen] = 0;
-        }
-        return;
+        out[0] = 127;
+        return 1;
     }
     if (code == 27)
     {
-        g_ilen = 0;
-        g_cursor = 0;
-        g_input[0] = 0;
-        return;
+        out[0] = 27;
+        return 1;
     }
     if (code == AXINPUT_KEY_UP)
     {
-        if (g_hpos > 0)
-        {
-            g_hpos--;
-            strcpy(g_input, g_cmdhist[g_hpos]);
-            g_ilen = strlen(g_input);
-            g_cursor = g_ilen;
-        }
-        return;
+        out[0] = 27; out[1] = '['; out[2] = 'A';
+        return 3;
     }
     if (code == AXINPUT_KEY_DOWN)
     {
-        if (g_hpos < g_hcount - 1)
-        {
-            g_hpos++;
-            strcpy(g_input, g_cmdhist[g_hpos]);
-            g_ilen = strlen(g_input);
-            g_cursor = g_ilen;
-        }
-        else
-        {
-            g_hpos = g_hcount;
-            g_ilen = 0;
-            g_cursor = 0;
-            g_input[0] = 0;
-        }
-        return;
-    }
-    if (code == AXINPUT_KEY_LEFT)
-    {
-        if (g_cursor > 0)
-            g_cursor--;
-        return;
+        out[0] = 27; out[1] = '['; out[2] = 'B';
+        return 3;
     }
     if (code == AXINPUT_KEY_RIGHT)
     {
-        if (g_cursor < g_ilen)
-            g_cursor++;
-        return;
+        out[0] = 27; out[1] = '['; out[2] = 'C';
+        return 3;
+    }
+    if (code == AXINPUT_KEY_LEFT)
+    {
+        out[0] = 27; out[1] = '['; out[2] = 'D';
+        return 3;
     }
     if (code == AXINPUT_KEY_HOME)
     {
-        g_cursor = 0;
-        return;
+        out[0] = 27; out[1] = '['; out[2] = 'H';
+        return 3;
     }
     if (code == AXINPUT_KEY_END)
     {
-        g_cursor = g_ilen;
-        return;
+        out[0] = 27; out[1] = '['; out[2] = 'F';
+        return 3;
     }
-    if (code >= 32 && code < 127 && g_ilen < IN_MAX - 1)
+    if (code >= 32 && code < 127)
     {
-        for (i = g_ilen; i > g_cursor; i--)
-            g_input[i] = g_input[i - 1];
-        g_input[g_cursor] = (char)code;
-        g_ilen++;
-        g_cursor++;
-        g_input[g_ilen] = 0;
+        out[0] = (char)code;
+        return 1;
     }
+    if (code >= 1 && code < 32)
+    {
+        out[0] = (char)code;
+        return 1;
+    }
+    return 0;
 }
 
-static void render(struct axgui_fb *fb, int tick)
-{
-    int cols, rows, i, y;
-    char bar[256];
-    char prompt[IN_MAX + 8];
-    cols = (int)fb->w / FONT_WIDTH;
-    if (cols > MAX_COLS)
-        cols = MAX_COLS;
-    rows = ((int)fb->h - 24 - FONT_HEIGHT - 6) / FONT_HEIGHT;
-    if (rows < 4)
-        rows = 4;
-
-    axgui_fill(fb, 0, 0, (int)fb->w, (int)fb->h, C_BG);
-    /* Title bar. */
-    axgui_fill(fb, 0, 0, (int)fb->w, 24, C_BAR);
-    refresh_cwd();
-    snprintf(bar, sizeof(bar), "axterm  %s   [Esc clears line]",
-             g_cwd);
-    axgui_text(fb, bar, 8, 4, C_FG, C_BAR);
-
-    /* Scrollback: last `rows` lines. */
-    y = 24 + 4;
-    {
-        int start = g_nlines - rows;
-        if (start < 0)
-            start = 0;
-        for (i = start; i < g_nlines; i++)
-        {
-            axgui_text_cell(fb, g_lines[i], cols, 8, y, C_FG, C_BG);
-            y += FONT_HEIGHT;
-        }
-    }
-    /* Input line. */
-    snprintf(prompt, sizeof(prompt), "$ %s", g_input);
-    axgui_text_cell(fb, prompt, cols, 8, (int)fb->h - FONT_HEIGHT - 6,
-                    C_PROMPT, C_BG);
-    /* Block cursor (blink 2 Hz). */
-    if ((tick / 15) % 2 == 0)
-    {
-        int cx = 8 + (2 + g_cursor) * FONT_WIDTH;
-        int cy = (int)fb->h - FONT_HEIGHT - 6;
-        axgui_fill(fb, cx, cy, FONT_WIDTH, FONT_HEIGHT, C_ACCENT);
-        if (g_cursor < g_ilen)
-            axgui_glyph(fb, g_input[g_cursor], cx, cy, C_BG, C_ACCENT);
-    }
-    /* Bottom hint. */
-    axgui_text(fb, "axterm: type 'help' | 'exit' returns to console",
-               8, (int)fb->h - FONT_HEIGHT - 6 + FONT_HEIGHT, C_DIM, C_BG);
-    (void)tick;
-}
-
-/* ---- compositor client mode (`axterm --wm ...`) ---- */
-
-static void render_content(struct axgui_fb *fb)
-{
-    int cols, rows, i, y;
-    char prompt[IN_MAX + 8];
-    cols = (int)fb->w / FONT_WIDTH;
-    if (cols > MAX_COLS)
-        cols = MAX_COLS;
-    rows = ((int)fb->h - FONT_HEIGHT) / FONT_HEIGHT;
-    if (rows < 2)
-        rows = 2;
-
-    axgui_fill(fb, 0, 0, (int)fb->w, (int)fb->h, C_BG);
-    y = 4;
-    {
-        int start = g_nlines - rows;
-        if (start < 0)
-            start = 0;
-        for (i = start; i < g_nlines; i++)
-        {
-            axgui_text_cell(fb, g_lines[i], cols, 8, y, C_FG, C_BG);
-            y += FONT_HEIGHT;
-        }
-    }
-    snprintf(prompt, sizeof(prompt), "$ %s", g_input);
-    axgui_text_cell(fb, prompt, cols, 8, (int)fb->h - FONT_HEIGHT - 2,
-                    C_PROMPT, C_BG);
-    /* Static block cursor (the client has no timer; it redraws on events). */
-    {
-        int cx = 8 + (2 + g_cursor) * FONT_WIDTH;
-        int cy = (int)fb->h - FONT_HEIGHT - 2;
-        axgui_fill(fb, cx, cy, FONT_WIDTH, FONT_HEIGHT, C_ACCENT);
-        if (g_cursor < g_ilen)
-            axgui_glyph(fb, g_input[g_cursor], cx, cy, C_BG, C_ACCENT);
-    }
-}
-
-/* Join argv[0..n) with spaces (for the -c initial command). */
+/* Join argv[0..n) with spaces (for the window client's -c command). */
 static void join_args(char **argv, int n, char *out, size_t cap)
 {
     size_t pos = 0;
@@ -437,98 +579,496 @@ static void join_args(char **argv, int n, char *out, size_t cap)
     out[pos] = 0;
 }
 
-static int run_wm_client(long shmid, int req_w, int req_h, int evfd,
-                         char **argv, int argc)
+static void close_extra_fds(int keep_a, int keep_b, int keep_c, int keep_d)
 {
-    struct axgui_fb cfb;
-    struct wm_win_hdr *hdr;
-    int cols, exit_req = 0;
-    (void)req_w;
-    (void)req_h;
-
-    g_wm_mode = 1;
-    printf("axterm-wm: attaching shm %ld evfd %d\n", shmid, evfd);
-    hdr = axgui_win_attach(shmid, &cfb);
-    if (!hdr)
+    int fd;
+    for (fd = 0; fd < AXTERM_MAX_FD; fd++)
     {
-        printf("axterm-wm: attach failed\n");
-        return 1;
+        if (fd == 0 || fd == 1 || fd == 2)
+            continue;
+        if (fd == keep_a || fd == keep_b || fd == keep_c || fd == keep_d)
+            continue;
+        close(fd);
     }
-    printf("axterm-wm: attached %ux%u, entering loop\n", cfb.w, cfb.h);
-    cols = (int)cfb.w / FONT_WIDTH;
-    if (cols > MAX_COLS)
-        cols = MAX_COLS;
+}
 
-    refresh_cwd();
-    term_put("axterm - terminal client (type 'help')", cols);
-    if (argc > 0)
+static int write_all(int fd, const char *buf, size_t len)
+{
+    size_t off = 0;
+    int tries = 0;
+    if (!buf)
+        return -1;
+    while (off < len)
     {
-        char cmd[IN_MAX];
-        char echo[IN_MAX + 4];
-        join_args(argv, argc, cmd, sizeof(cmd));
-        if (cmd[0])
+        long r = write(fd, buf + off, len - off);
+        if (r > 0)
         {
-            snprintf(echo, sizeof(echo), "$ %s", cmd);
-            term_put(echo, cols);
-            add_cmdhist(cmd);
-            exec_line(cmd, cols, &exit_req);
-            if (exit_req)
-                return 0;
+            off += (size_t)r;
+            tries = 0;
+            continue;
         }
-    }
-    render_content(&cfb);
-    hdr->seq++;
-    hdr->ready = 1;
-
-    for (;;)
-    {
-        struct wm_event ev;
-        if (hdr->closed)
+        if (r == 0)
         {
-            printf("axterm-wm: closed by compositor\n");
-            break;
+            if (++tries > 1000)
+                return -1;
+            axgui_msleep(1);
+            continue;
         }
-        if (axgui_wm_recv(evfd, &ev) < 0)
-        {
-            printf("axterm-wm: event channel EOF/err\n");
-            break; /* compositor went away */
-        }
-        if (ev.type != WM_EV_KEY)
-            continue; /* mouse is decorative for a terminal */
-        handle_key(ev.code, cols, &exit_req, -1);
-        if (exit_req)
-            break;
-        render_content(&cfb);
-        hdr->seq++;
+        return -1;
     }
     return 0;
 }
 
-int main(int argc, char **argv)
+/* SIGKILL the process tree rooted at `root` (children before parents).
+   Used only for terminal teardown: a closed window must not leave its shell
+   or that shell's jobs behind. Never targets the caller itself.
+
+   Two hard rules make this deterministic instead of "rng":
+   * the root must be present in the CURRENT sys_ps snapshot, otherwise we
+     kill nothing: a bare kill-by-pid after the root already exited could
+     hit an unrelated recycled pid.
+   * kills go children-first (depth order, root last) so no child is
+     orphaned mid-pass; up to 3 snapshot passes catch late forks. */
+static void kill_process_tree(long root)
+{
+    struct proc_info ps[64];
+    int marked[64];
+    int depth[64];
+    long self;
+    int n, i, j, pass;
+    if (root <= 0)
+        return;
+    self = sys_getpid();
+    if (root == self)
+        return;
+    for (pass = 0; pass < 3; pass++)
+    {
+        int maxd = 0;
+        int changed;
+        int root_seen = 0;
+        n = sys_ps(ps, 64);
+        if (n <= 0)
+        {
+            /* Table unreadable: fall back to the root alone rather than
+               leaving the whole tree behind. */
+            kill((int)root, SIGKILL);
+            return;
+        }
+        if (n > 64)
+            n = 64;
+        for (i = 0; i < n; i++)
+        {
+            marked[i] = 0;
+            depth[i] = -1;
+            if (ps[i].pid == (int)root)
+                root_seen = 1;
+        }
+        if (!root_seen)
+            return;
+        for (i = 0; i < n; i++)
+        {
+            if (ps[i].pid == (int)root)
+                marked[i] = 1;
+        }
+        for (;;)
+        {
+            changed = 0;
+            for (i = 0; i < n; i++)
+            {
+                if (marked[i] || ps[i].pid <= 0)
+                    continue;
+                for (j = 0; j < n; j++)
+                {
+                    if (marked[j] && ps[i].parent_pid == ps[j].pid)
+                    {
+                        marked[i] = 1;
+                        changed = 1;
+                        break;
+                    }
+                }
+            }
+            if (!changed)
+                break;
+        }
+        for (i = 0; i < n; i++)
+        {
+            if (ps[i].pid == (int)root)
+                depth[i] = 0;
+        }
+        for (;;)
+        {
+            changed = 0;
+            for (i = 0; i < n; i++)
+            {
+                if (!marked[i] || depth[i] >= 0)
+                    continue;
+                for (j = 0; j < n; j++)
+                {
+                    if (marked[j] && depth[j] >= 0 &&
+                        ps[i].parent_pid == ps[j].pid)
+                    {
+                        depth[i] = depth[j] + 1;
+                        changed = 1;
+                        break;
+                    }
+                }
+            }
+            if (!changed)
+                break;
+        }
+        for (i = 0; i < n; i++)
+        {
+            if (!marked[i])
+                continue;
+            if (depth[i] < 0)
+                depth[i] = 1000; /* detached chain: kill first */
+            if (depth[i] > maxd && depth[i] < 1000)
+                maxd = depth[i];
+        }
+        {
+            int d;
+            for (d = maxd + 1; d >= 0; d--)
+            {
+                for (i = 0; i < n; i++)
+                {
+                    if (marked[i] && depth[i] == d &&
+                        ps[i].pid != (int)self && ps[i].pid != (int)root)
+                        kill(ps[i].pid, SIGKILL);
+                }
+            }
+        }
+        kill((int)root, SIGKILL);
+        /* Next pass re-snapshots and stops as soon as the root is gone. */
+    }
+}
+
+/* Blocking wait with a deadline, so teardown never hangs forever if a child
+   is already gone or refuses to die promptly. Returns 0 when reaped. */
+static int reap_child_deadline(long pid, int *status, int timeout_ms)
+{
+    int waited = 0;
+    int st = 0;
+    long q;
+    if (pid <= 0)
+        return -1;
+    for (;;)
+    {
+        errno = 0;
+        q = sys_waitpid_nb((int)pid, &st);
+        if (q == pid)
+        {
+            if (status)
+                *status = st;
+            return 0;
+        }
+        if (q < 0 && errno == ECHILD)
+            return 0; /* already gone (or never ours): counts as reaped */
+        if (waited >= timeout_ms)
+            return -1;
+        axgui_msleep(10);
+        waited += 10;
+    }
+}
+
+static int shell_spawn(struct shell_session *s, int uid, int gid, int evfd)
+{
+    int to_shell[2] = { -1, -1 };
+    int from_shell[2] = { -1, -1 };
+    long pid;
+    if (!s)
+        return -1;
+    s->pid = -1;
+    s->to_shell = -1;
+    s->from_shell = -1;
+    if (pipe(to_shell) < 0 || pipe(from_shell) < 0)
+    {
+        if (to_shell[0] >= 0 || to_shell[1] >= 0)
+        {
+            close(to_shell[0]);
+            close(to_shell[1]);
+        }
+        return -1;
+    }
+    pid = sys_fork();
+    if (pid < 0)
+    {
+        close(to_shell[0]);
+        close(to_shell[1]);
+        close(from_shell[0]);
+        close(from_shell[1]);
+        return -1;
+    }
+    if (pid == 0)
+    {
+        char *argv[2];
+        char *envp[1];
+        int fd;
+        if (dup2(to_shell[0], 0) < 0)
+            sys_exit(127);
+        if (dup2(from_shell[1], 1) < 0)
+            sys_exit(127);
+        if (dup2(from_shell[1], 2) < 0)
+            sys_exit(127);
+        /* The shell must not retain the compositor event pipe (or any
+           other inherited descriptor): a leaked read alias would defeat
+           the window's EOF delivery, a leaked write alias the shell's. */
+        if (evfd > 2)
+            close(evfd);
+        for (fd = 3; fd < AXTERM_MAX_FD; fd++)
+            close(fd);
+        /* Drop to the session user (axlogin passes --user after a successful
+           login). Refuse to continue if the drop fails: never run a user
+           session with the wrong credentials. */
+        if (uid >= 0)
+        {
+            if (setgid((gid_t)gid) < 0 || setuid((uid_t)uid) < 0)
+            {
+                write(2, "axterm: cannot drop privileges\n", 31);
+                sys_exit(127);
+            }
+        }
+        argv[0] = "sh";
+        argv[1] = 0;
+        envp[0] = 0;
+        execve("/bin/sh", argv, envp);
+        write(2, "axterm: cannot exec /bin/sh\n", 28);
+        sys_exit(127);
+    }
+    /* Parent keeps the terminal side of both pipes. */
+    close(to_shell[0]);
+    close(from_shell[1]);
+    s->pid = pid;
+    s->to_shell = to_shell[1];
+    s->from_shell = from_shell[0];
+    return 0;
+}
+
+/* ---- compositor client mode (`axterm --wm ...`) ---- */
+
+/* Keyboard pump: the only reader of the compositor event pipe. Forwards
+   keystrokes to the shell, then tears the shell session down when the
+   compositor closes the window (evfd EOF). */
+static void window_keyboard_pump(int evfd, int shell_in, long shell_pid)
+{
+    struct wm_event ev;
+    for (;;)
+    {
+        char seq[4];
+        int n;
+        if (axgui_wm_recv(evfd, &ev) < 0)
+            break;
+        if (ev.type != WM_EV_KEY)
+            continue;
+        n = term_key_bytes(ev.code, seq);
+        if (n > 0 && write_all(shell_in, seq, (size_t)n) < 0)
+            break; /* shell side gone: unwind instead of spinning */
+    }
+    kill_process_tree(shell_pid);
+    close(shell_in);
+    close(evfd);
+}
+
+static int run_wm_client(struct axclient *cx, char **cargv, int cargc,
+                         int uid, int gid)
+{
+    struct shell_session sh;
+    struct term_state term;
+    char out[TERM_OUT_CHUNK];
+    char cmd[TERM_CMD_MAX];
+    long helper = -1;
+    int evfd = cx->evfd;
+    int shell_status = 1;
+    int shell_gone = 0;
+    int helper_gone = 0;
+    int out_eof = 0;
+    int closing = 0;
+
+    /* axclient_init (in main) already sanitised fds, attached the window
+       and checked the generation: the header is valid from here on. */
+    if (shell_spawn(&sh, uid, gid, evfd) < 0)
+    {
+        printf("axterm-wm: cannot start /bin/sh\n");
+        return 1;
+    }
+    if (cargv && cargc > 0)
+    {
+        join_args(cargv, cargc, cmd, sizeof(cmd));
+        if (cmd[0])
+        {
+            size_t n = strlen(cmd);
+            if (n + 1 < sizeof(cmd))
+            {
+                cmd[n++] = '\n';
+                cmd[n] = 0;
+                write_all(sh.to_shell, cmd, n);
+            }
+        }
+    }
+    helper = sys_fork();
+    if (helper < 0)
+    {
+        kill_process_tree(sh.pid);
+        reap_child_deadline(sh.pid, 0, 2000);
+        close(sh.to_shell);
+        close(sh.from_shell);
+        return 1;
+    }
+    if (helper == 0)
+    {
+        /* Keyboard helper owns the event pipe and the shell's stdin. */
+        close(sh.from_shell);
+        window_keyboard_pump(evfd, sh.to_shell, sh.pid);
+        sys_exit(0);
+    }
+    /* Session supervisor/renderer: sole reader of shell output. Closing our
+       copies leaves exactly one reader/writer on each session pipe. */
+    close(sh.to_shell);
+    close(evfd);
+
+    term_init(&term, (int)cx->fb.w / FONT_WIDTH,
+              ((int)cx->fb.h - 8) / FONT_HEIGHT);
+    term_status(&term, "axiome terminal - /bin/sh");
+    axclient_begin(cx);
+    term_draw(&cx->fb, &term, 8, 4);
+    cx->hdr->ready = 1;
+    axclient_commit(cx);
+
+    for (;;)
+    {
+        long n = read(sh.from_shell, out, sizeof(out));
+        if (n > 0)
+        {
+            term_feed(&term, out, (size_t)n);
+            axclient_begin(cx);
+            term_draw(&cx->fb, &term, 8, 4);
+            axclient_commit(cx);
+        }
+        else if (n == 0)
+        {
+            out_eof = 1;
+        }
+        else
+        {
+            out_eof = 1;
+            closing = 1;
+        }
+        if (axclient_closed(cx) || axclient_stale(cx))
+            closing = 1;
+        if (helper > 0 && !helper_gone)
+        {
+            long hq;
+            errno = 0;
+            hq = sys_waitpid_nb((int)helper, 0);
+            if (hq == helper || (hq < 0 && errno == ECHILD))
+            {
+                /* No input path remains; unwind instead of buffering keys
+                   for a dead reader. */
+                helper_gone = 1;
+                closing = 1;
+            }
+        }
+        if (!shell_gone)
+        {
+            int st = 0;
+            long q;
+            errno = 0;
+            q = sys_waitpid_nb((int)sh.pid, &st);
+            if (q == sh.pid)
+            {
+                char done[64];
+                shell_gone = 1;
+                shell_status = st;
+                snprintf(done, sizeof(done), "[shell exited, status %d]",
+                         st);
+                term_status(&term, done);
+                axclient_begin(cx);
+                term_draw(&cx->fb, &term, 8, 4);
+                axclient_commit(cx);
+            }
+            else if (q < 0 && errno == ECHILD)
+            {
+                shell_gone = 1;
+            }
+        }
+        if (closing && !shell_gone)
+            kill_process_tree(sh.pid);
+        if (out_eof && shell_gone)
+            break;
+        if (out_eof && !shell_gone)
+        {
+            /* The shell closed stdout but has not exited (or left a child
+               holding it): unwind the session instead of spinning. */
+            kill_process_tree(sh.pid);
+            if (reap_child_deadline(sh.pid, &shell_status, 2000) == 0)
+            {
+                char done[64];
+                shell_gone = 1;
+                snprintf(done, sizeof(done), "[shell exited, status %d]",
+                         shell_status);
+                term_status(&term, done);
+                axclient_begin(cx);
+                term_draw(&cx->fb, &term, 8, 4);
+                axclient_commit(cx);
+                break;
+            }
+            axgui_msleep(10);
+        }
+    }
+
+    axclient_begin(cx);
+    term_draw(&cx->fb, &term, 8, 4);
+    axclient_commit(cx);
+    close(sh.from_shell);
+    if (helper > 0)
+    {
+        /* The helper blocks in the event read and may outlive the shell
+           (plain `exit` keeps the window open with no input path). SIGKILL
+           reaches it promptly, so this blocking reap always terminates
+           and no pump process is ever orphaned. */
+        kill((int)helper, SIGKILL);
+        sys_waitpid((int)helper, 0);
+    }
+    return shell_status;
+}
+
+/* ---- standalone mode (fullscreen DRI terminal) ---- */
+
+/* Input pump for standalone mode: /Devices/input0 is already non-blocking,
+   so one helper can poll it while the supervisor blocks on shell output. */
+static void standalone_input_pump(int input_fd, int shell_in, long shell_pid)
+{
+    struct axinput_event ev[64];
+    (void)shell_pid;
+    for (;;)
+    {
+        int n = axgui_poll(input_fd, ev, 64);
+        int i;
+        for (i = 0; i < n; i++)
+        {
+            char seq[4];
+            int m;
+            if (ev[i].type != AXINPUT_TYPE_KEY)
+                continue;
+            m = term_key_bytes(ev[i].code, seq);
+            if (m > 0)
+                write_all(shell_in, seq, (size_t)m);
+        }
+        axgui_msleep(5);
+    }
+}
+
+static int run_standalone(void)
 {
     struct axgui_fb fb;
-    int input_fd;
-    int exit_req = 0;
-    int tick = 0;
-    struct axinput_event ev[64];
-    (void)argv;
-
-    /* Compositor client: `axterm --wm <shmid> <w> <h> <evfd> [-c cmd...]`. */
-    if (argc >= 6 && strcmp(argv[1], "--wm") == 0)
-    {
-        long shmid = atol(argv[2]);
-        int w = atoi(argv[3]);
-        int h = atoi(argv[4]);
-        int evfd = atoi(argv[5]);
-        int ci = 0;
-        char **cargv = 0;
-        if (argc > 7 && strcmp(argv[6], "-c") == 0 && argc > 8)
-        {
-            ci = argc - 7;
-            cargv = &argv[7];
-        }
-        return run_wm_client(shmid, w, h, evfd, cargv, ci);
-    }
+    struct shell_session sh;
+    struct term_state term;
+    char out[TERM_OUT_CHUNK];
+    int input_fd = -1;
+    long helper = -1;
+    int shell_status = 1;
+    int shell_gone = 0;
+    int helper_gone = 0;
+    int out_eof = 0;
 
     fb.fd = -1;
     if (axgui_dri_open(&fb) < 0)
@@ -539,42 +1079,109 @@ int main(int argc, char **argv)
     input_fd = axgui_input_open();
     if (input_fd >= 0)
         axgui_grab(input_fd, 1);
+    close_extra_fds(input_fd, fb.fd, -1, -1);
+    if (shell_spawn(&sh, -1, -1, -1) < 0)
+    {
+        printf("axterm: cannot start /bin/sh\n");
+        goto stand_fail;
+    }
+    helper = sys_fork();
+    if (helper < 0)
+    {
+        kill_process_tree(sh.pid);
+        reap_child_deadline(sh.pid, 0, 2000);
+        close(sh.to_shell);
+        close(sh.from_shell);
+        goto stand_fail;
+    }
+    if (helper == 0)
+    {
+        close(sh.from_shell);
+        /* Keep only the console stdio, the polled input device and the
+           shell's stdin. In particular the helper must not retain the DRI
+           framebuffer descriptor owned by the supervisor. */
+        close_extra_fds(input_fd, sh.to_shell, -1, -1);
+        standalone_input_pump(input_fd, sh.to_shell, sh.pid);
+        sys_exit(0);
+    }
+    /* Supervisor/renderer owns the display and the shell's output. */
+    close(sh.to_shell);
 
-    refresh_cwd();
-    term_put("axterm v1.0 - graphical terminal (type 'help')", 80);
-    /* Drain stale keys pressed while the shell prompt was up. */
-    if (input_fd >= 0)
-        axgui_poll(input_fd, ev, 64);
+    term_init(&term, (int)fb.w / FONT_WIDTH,
+              ((int)fb.h - 24 - 8) / FONT_HEIGHT);
+    axgui_fill(&fb, 0, 0, (int)fb.w, (int)fb.h, C_BG);
+    axgui_fill(&fb, 0, 0, (int)fb.w, 24, C_BAR);
+    axgui_text(&fb, "axterm - /bin/sh", 8, 4, C_FG, C_BAR);
+    term_draw(&fb, &term, 8, 28);
+    axgui_present(&fb);
 
     for (;;)
     {
-        int n, i;
-        int cols = (int)fb.w / FONT_WIDTH;
-        if (cols > MAX_COLS)
-            cols = MAX_COLS;
-        if (input_fd >= 0)
+        long n = read(sh.from_shell, out, sizeof(out));
+        if (n > 0)
         {
-            n = axgui_poll(input_fd, ev, 64);
-            for (i = 0; i < n; i++)
-            {
-                if (ev[i].type != AXINPUT_TYPE_KEY)
-                    continue;
-                handle_key(ev[i].code, cols, &exit_req, input_fd);
-                if (exit_req)
-                    break;
-            }
-            if (exit_req)
-                break;
+            term_feed(&term, out, (size_t)n);
+            axgui_fill(&fb, 0, 0, (int)fb.w, 24, C_BAR);
+            axgui_text(&fb, "axterm - /bin/sh", 8, 4, C_FG, C_BAR);
+            term_draw(&fb, &term, 8, 28);
+            axgui_present(&fb);
+        }
+        else if (n == 0)
+        {
+            out_eof = 1;
         }
         else
         {
-            sys_yield();
+            out_eof = 1;
         }
-        render(&fb, tick++);
-        axgui_present(&fb);
-        axgui_msleep(33);
+        if (helper > 0 && !helper_gone)
+        {
+            long hq;
+            errno = 0;
+            hq = sys_waitpid_nb((int)helper, 0);
+            if (hq == helper || (hq < 0 && errno == ECHILD))
+                helper_gone = 1;
+        }
+        if (!shell_gone)
+        {
+            int st = 0;
+            long q;
+            errno = 0;
+            q = sys_waitpid_nb((int)sh.pid, &st);
+            if (q == sh.pid)
+            {
+                shell_gone = 1;
+                shell_status = st;
+            }
+            else if (q < 0 && errno == ECHILD)
+            {
+                shell_gone = 1;
+            }
+        }
+        if (helper_gone && !shell_gone)
+            kill_process_tree(sh.pid);
+        if (out_eof && shell_gone)
+            break;
+        if (out_eof && !shell_gone)
+        {
+            kill_process_tree(sh.pid);
+            if (reap_child_deadline(sh.pid, &shell_status, 2000) == 0)
+            {
+                shell_gone = 1;
+                break;
+            }
+            axgui_msleep(10);
+        }
     }
 
+    if (helper > 0)
+    {
+        /* The standalone helper polls with syscalls, so SIGKILL reaches it
+           promptly and the blocking reap below is safe. */
+        kill(helper, SIGKILL);
+        sys_waitpid((int)helper, 0);
+    }
+    close(sh.from_shell);
     if (input_fd >= 0)
     {
         axgui_grab(input_fd, 0);
@@ -582,5 +1189,49 @@ int main(int argc, char **argv)
     }
     axgui_close(&fb);
     printf("\n[axterm closed]\n");
-    return 0;
+    return shell_status;
+
+stand_fail:
+    if (input_fd >= 0)
+    {
+        axgui_grab(input_fd, 0);
+        close(input_fd);
+    }
+    axgui_close(&fb);
+    return 1;
+}
+
+int main(int argc, char **argv)
+{
+    /* Compositor client: `axterm --wm <shmid> <w> <h> <evfd> [<gen>]
+       [--user <uid> <gid>] [-c cmd...]`. */
+    if (argc >= 6 && strcmp(argv[1], "--wm") == 0)
+    {
+        struct axclient cx;
+        char **cargv = 0;
+        int cargc = 0;
+        int uid = -1;
+        int gid = -1;
+        int rest = axclient_init(&cx, argc, argv, "axterm");
+        long u, g;
+        if (rest < 0)
+            return 1;
+        if (argc > rest + 2 && strcmp(argv[rest], "--user") == 0 &&
+            axclient_parse_num(argv[rest + 1], &u) == 0 && u >= 0 &&
+            axclient_parse_num(argv[rest + 2], &g) == 0 && g >= 0)
+        {
+            uid = (int)u;
+            gid = (int)g;
+            rest += 3;
+        }
+        if (argc > rest + 1 && strcmp(argv[rest], "-c") == 0 &&
+            argc > rest + 2)
+        {
+            cargv = &argv[rest + 1];
+            cargc = argc - (rest + 1);
+        }
+        return run_wm_client(&cx, cargv, cargc, uid, gid);
+    }
+
+    return run_standalone();
 }
