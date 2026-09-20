@@ -113,3 +113,27 @@ isr_serial:
     push 0
     push 0x24
     jmp isr_common
+
+.global isr_xhci0
+isr_xhci0:
+    push 0
+    push 0x30
+    jmp isr_common
+
+.global isr_xhci1
+isr_xhci1:
+    push 0
+    push 0x31
+    jmp isr_common
+
+.global isr_xhci2
+isr_xhci2:
+    push 0
+    push 0x32
+    jmp isr_common
+
+.global isr_xhci3
+isr_xhci3:
+    push 0
+    push 0x33
+    jmp isr_common

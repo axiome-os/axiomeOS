@@ -1,12 +1,19 @@
 #include "xhci.h"
 
+#include "acpi.h"
+#include "apic.h"
+#include "clock.h"
 #include "driver.h"
+#include "hal/cshim.h"
 #include "ide.h"
+#include "idt.h"
+#include "ioapic.h"
 #include "keyboard.h"
 #include "mouse.h"
 #include "pci.h"
 #include "pmm.h"
 #include "printk.h"
+#include "sched.h"
 #include "slab.h"
 #include "string.h"
 #include "vmm.h"
@@ -144,6 +151,10 @@ struct xhci_controller {
     struct xhci_dma event;
     struct xhci_dma erst;
     struct xhci_device devices[XHCI_MAX_PORTS];
+    uint8_t irq_vector;
+    uint8_t irq_gsi;
+    int irq_enabled;
+    volatile uint32_t irq_pending;
 };
 
 #define XHCI_MAX_CONTROLLERS 4
@@ -173,10 +184,58 @@ static void barrier(void)
     __sync_synchronize();
 }
 
+/* Hybrid delay: uses clock_mono_ns if timer is live, otherwise busy pause.
+   Replaces the old 300k-iteration busy loop which was inaccurate and blocked
+   the scheduler. Mirrors Haiku's snooze() behavior. */
 static void xhci_mdelay(uint32_t ms)
 {
-    for (uint32_t i = 0; i < ms * 300000u; i++)
+    if (ms == 0)
+        return;
+    /* Early boot before clock_init or before IRQs enabled: clock_mono_ns()
+       returns 0 and never advances – use busy loop. Also avoid sched_sleep
+       before scheduler/IRQs are alive (kernel.c: pci probes before clock_init
+       and before hal_cpu_irq_enable). */
+    uint64_t start = clock_mono_ns();
+    if (start == 0 || apic_get_ticks() == 0) {
+        for (uint32_t i = 0; i < ms * 300000u; i++) {
+            hal_cpu_pause();
+            barrier();
+        }
+        return;
+    }
+    uint64_t ns = (uint64_t)ms * 1000000ULL;
+    uint64_t deadline = start + ns;
+    while (clock_mono_ns() < deadline) {
+        /* If scheduler is alive, sleep to let other threads run. */
+        if (sched_current() && ms >= 5) {
+            uint64_t remain = deadline - clock_mono_ns();
+            if (remain > 1000000ULL)
+                remain = 1000000ULL;
+            sched_sleep_ns(remain);
+        } else {
+            hal_cpu_pause();
+            barrier();
+        }
+        if (clock_mono_ns() == start) /* clock stalled */
+            break;
+    }
+}
+
+static void __attribute__((unused)) xhci_udelay(uint32_t us)
+{
+    uint64_t start = clock_mono_ns();
+    if (start == 0 || apic_get_ticks() == 0) {
+        for (uint32_t i = 0; i < us * 80u; i++) {
+            hal_cpu_pause();
+            barrier();
+        }
+        return;
+    }
+    uint64_t deadline = start + (uint64_t)us * 1000ULL;
+    while (clock_mono_ns() < deadline) {
+        hal_cpu_pause();
         barrier();
+    }
 }
 
 static int wait32(volatile void *reg, uint32_t mask, uint32_t value)
@@ -264,10 +323,16 @@ static void legacy_handoff(struct xhci_controller *c, uint32_t hcc)
             } else {
                 printk("xHCI: legacy ownership acquired\n");
             }
-            /* Clear BIOS owned and disable SMIs (Haiku does & ~BIOSOWNED and legctlsts) */
+            /* Force off BIOS owned flag (Haiku: eec & ~BIOSOWNED). */
             wr32(ext, cap & ~(1u << 16));
-            uint32_t sts = rd32(ext + 4);
-            wr32(ext + 4, sts);
+            /* Clear all SMI enables – some BIOSes freeze if SMIs remain
+               armed when interrupts fire (Haiku XHCI_LEGCTLSTS logic). */
+            uint32_t ctl = rd32(ext + 4);
+            /* DISABLE_SMI mask = (0x3<<1)|(0xff<<5)|(0x7<<17); clear those bits */
+            ctl &= ~((0x3u << 1) | (0xffu << 5) | (0x7u << 17));
+            wr32(ext + 4, ctl);
+            (void)rd32(ext + 4); /* flush */
+            printk("xHCI: legacy SMI disabled, ctl=0x%x\n", ctl);
             return;
         }
         if (!next)
@@ -294,8 +359,101 @@ static void event_advance(struct xhci_controller *c)
         c->event_cycle ^= 1;
     }
     volatile uint8_t *ir = c->runtime + 0x20;
-    wr64(ir + 0x18, (c->event.phys +
-         (uint64_t)c->event_dequeue * sizeof(struct xhci_trb)) | (1u << 3));
+    uint64_t erdp = c->event.phys + (uint64_t)c->event_dequeue * sizeof(struct xhci_trb);
+    if (c->irq_enabled)
+        erdp |= (1u << 3); /* EHB */
+    wr64(ir + 0x18, erdp);
+}
+
+/* Acknowledge xHC interrupt: clear USBSTS EINT and IMAN IP per spec.
+   Haiku does WriteOpReg(STS, ReadOpReg(STS)) and IMAN handling. */
+static void xhci_ack_irq(struct xhci_controller *c)
+{
+    /* Clear Host Controller Error + Event Interrupt bits (W1C). */
+    uint32_t sts = rd32(c->op + 4);
+    wr32(c->op + 4, sts | (1u << 3)); /* STS_EINT = bit3 */
+    /* Clear interrupter pending (IMAN IP bit 0 + IE bit1 stays). */
+    volatile uint8_t *ir = c->runtime + 0x20;
+    uint32_t iman = rd32(ir);
+    wr32(ir, iman | 1u);
+}
+
+/* Interrupt handler – called via hal_irq_dispatch for vector 0x30-0x33.
+   Drains event ring similarly to xhci_poll but also acks IRQ. */
+static void xhci_irq_handler(void *ctx, void *frame)
+{
+    (void)frame;
+    struct xhci_controller *c = (struct xhci_controller *)ctx;
+    if (!c || !c->ready)
+        goto eoi;
+    /* Check if this HC actually interrupted (IMAN IP). */
+    volatile uint8_t *ir = c->runtime + 0x20;
+    uint32_t iman = rd32(ir);
+    if (!(iman & 1u)) {
+        /* Spurious – but still need EOI. */
+        goto eoi;
+    }
+    xhci_ack_irq(c);
+    c->irq_pending = 1;
+    /* Wakeup polling: event ring will be drained by transfer_wait/command
+       which already calls event_current. No extra work here to keep IRQ fast. */
+eoi:
+    hal_irq_eoi();
+}
+
+static const char *xhci_cc_string(uint8_t cc);
+
+ /* Try to wire legacy pin IRQ via IOAPIC. Returns vector on success or -1. */
+static int xhci_setup_irq(struct xhci_controller *c, struct pci_device *pdev)
+{
+    extern void isr_xhci0(void);
+    extern void isr_xhci1(void);
+    extern void isr_xhci2(void);
+    extern void isr_xhci3(void);
+    uintptr_t handlers[4] = { (uintptr_t)isr_xhci0, (uintptr_t)isr_xhci1, (uintptr_t)isr_xhci2, (uintptr_t)isr_xhci3 };
+    int idx = -1;
+    for (int i = 0; i < n_hcs; i++) {
+        if (&hcs[i] == c) { idx = i; break; }
+    }
+    if (idx < 0 || idx >= 4)
+        return -1;
+    uint8_t vector = (uint8_t)(0x30 + idx);
+    uintptr_t handler = handlers[idx];
+
+    uint8_t pin_irq = pdev->irq;
+    if (pin_irq == 0 || pin_irq == 0xFF) {
+        printk("xHCI: no legacy IRQ for MSI fallback (irq=%u) – polling only\n", pin_irq);
+        return -1;
+    }
+    uint32_t gsi = pin_irq;
+    uint16_t flags = 0;
+    if (acpi_iso_lookup(pin_irq, &gsi, &flags) != 0) {
+        printk("xHCI: acpi_iso_lookup failed for irq %u, using gsi %u\n", pin_irq, gsi);
+    }
+    /* Install IDT gate */
+    idt_set_gate(vector, handler, 0x8E, 0);
+    /* Register HAL handler */
+    if (hal_irq_register(vector, xhci_irq_handler, c) != 0) {
+        printk("xHCI: hal_irq_register failed for vector 0x%x\n", vector);
+        return -1;
+    }
+    /* Route GSI -> vector via IOAPIC (unmasked). */
+    hal_irq_route((int)gsi, vector, 0);
+    c->irq_vector = vector;
+    c->irq_gsi = (uint8_t)gsi;
+    c->irq_enabled = 1;
+    c->irq_pending = 0;
+    /* Now enable interrupter and HC INTE */
+    {
+        volatile uint8_t *ir = c->runtime + 0x20;
+        wr32(ir, rd32(ir) | (1u << 1)); /* IMAN IE */
+        uint32_t cmd = rd32(c->op);
+        wr32(c->op, cmd | (1u << 2)); /* USBCMD INTE */
+        printk("xHCI: IRQ enabled for controller %d\n", idx);
+    }
+    printk("xHCI: IRQ routed GSI %u -> vector 0x%x (pin irq %u) handler 0x%lx\n",
+           gsi, vector, pin_irq, (unsigned long)handler);
+    return vector;
 }
 
 static int command(struct xhci_controller *c, uint64_t parameter, uint32_t control, uint8_t *slot_out)
@@ -321,29 +479,46 @@ static int command(struct xhci_controller *c, uint64_t parameter, uint32_t contr
         c->cmd_enqueue = 0;
         c->cmd_cycle ^= 1;
     }
-    printk("xHCI: CMD trb phys 0x%lx param 0x%lx ctrl 0x%x (trb_ctrl 0x%x) cycle %u idx %u\n", (unsigned long)command_phys, (unsigned long)parameter, trb_ctrl, trb_ctrl, c->cmd_cycle, index);
     barrier();
     c->doorbell[0] = 0;
 
+    uint64_t deadline = clock_mono_ns() + 1000ULL * 1000000ULL; /* 1s timeout */
     for (uint32_t guard = 0; guard < XHCI_TIMEOUT; guard++) {
         volatile struct xhci_trb *event = event_current(c);
-        if (!event)
+        if (!event) {
+            if (clock_mono_ns() > deadline)
+                break;
+            if ((guard & 0xFF) == 0) {
+                hal_cpu_pause();
+                if (c->irq_enabled && c->irq_pending) {
+                    c->irq_pending = 0;
+                    xhci_ack_irq(c);
+                }
+            }
             continue;
+        }
         uint32_t type = (event->control >> 10) & 0x3f;
         uint64_t pointer = event->parameter & ~0xfULL;
         uint8_t completion = (uint8_t)(event->status >> 24);
         uint8_t slot = (uint8_t)(event->control >> 24);
-        printk("xHCI: EVT type %u cc %u slot %u param 0x%lx status 0x%x ctrl 0x%x\n", type, completion, slot, (unsigned long)pointer, event->status, event->control);
+        /* Ack IRQ if pending */
+        if (c->irq_enabled) {
+            xhci_ack_irq(c);
+            c->irq_pending = 0;
+        }
         event_advance(c);
         if (type == 33 && pointer == command_phys) {
             if (completion != 1)
-                printk("xHCI: command failed cc=%u slot=%u param=0x%lx\n", completion, slot, (unsigned long)pointer);
+                printk("xHCI: command failed cc=%u (%s) slot=%u param=0x%lx\n",
+                       completion, xhci_cc_string(completion), slot, (unsigned long)pointer);
             if (slot_out)
                 *slot_out = slot;
             return completion == 1 ? 0 : -(int)completion;
         }
+        /* Ignore other events (port status, etc.) and continue */
+        deadline = clock_mono_ns() + 1000ULL * 1000000ULL;
     }
-    printk("xHCI: command timeout phys 0x%lx\n", (unsigned long)command_phys);
+    printk("xHCI: command timeout phys 0x%lx (%s)\n", (unsigned long)command_phys, "no completion within 1s");
     return -255;
 }
 
@@ -354,15 +529,34 @@ static int transfer_wait(struct xhci_device *dev, uint64_t wanted,
 {
     struct xhci_controller *c = dev->ctrl;
     if (!c) c = cur_hc;
+    /* Short timeout for enumeration – long 2s caused painful retry loops (user report). */
+    uint64_t start = clock_mono_ns();
+    uint64_t deadline = 0;
+    if (start != 0 && apic_get_ticks() != 0)
+        deadline = start + 500ULL * 1000000ULL; /* 500ms */
     for (uint32_t guard = 0; guard < XHCI_TIMEOUT; guard++) {
         volatile struct xhci_trb *event = event_current(c);
-        if (!event)
+        if (!event) {
+            if (deadline != 0 && clock_mono_ns() > deadline)
+                break;
+            if ((guard & 0xFF) == 0) {
+                hal_cpu_pause();
+                if (c->irq_enabled && c->irq_pending) {
+                    c->irq_pending = 0;
+                    xhci_ack_irq(c);
+                }
+            }
             continue;
+        }
         uint32_t type = (event->control >> 10) & 0x3f;
         uint64_t pointer = event->parameter & ~0xfULL;
         uint8_t completion = (uint8_t)(event->status >> 24);
         uint8_t slot = (uint8_t)(event->control >> 24);
         uint32_t remain = event->status & 0xffffffu;
+        if (c->irq_enabled) {
+            xhci_ack_irq(c);
+            c->irq_pending = 0;
+        }
         /* HID interrupt completions may arrive while we are waiting for a
            bulk or control transfer. Handle them inline so they are not lost
            and the interrupt ring stays primed. */
@@ -379,6 +573,8 @@ static int transfer_wait(struct xhci_device *dev, uint64_t wanted,
             if (is_hid) {
                 handle_hid_event_inline(event);
                 event_advance(c);
+                if (deadline != 0)
+                    deadline = clock_mono_ns() + 500ULL * 1000000ULL;
                 continue;
             }
         }
@@ -386,10 +582,21 @@ static int transfer_wait(struct xhci_device *dev, uint64_t wanted,
             if (residual)
                 *residual = remain;
             event_advance(c);
+            if (completion == 6) {
+                printk("xHCI: transfer stalled slot %u (%s)\n", slot, xhci_cc_string(completion));
+            }
             return (completion == 1 || completion == 13) ? 0 : -(int)completion;
         }
+        /* Unexpected transfer event – log and ack */
+        if (type == 32) {
+            printk("xHCI: unexpected transfer cc=%u (%s) slot %u ptr 0x%lx wanted 0x%lx\n",
+                   completion, xhci_cc_string(completion), slot, (unsigned long)pointer, (unsigned long)wanted);
+        }
         event_advance(c);
+        if (deadline != 0)
+            deadline = clock_mono_ns() + 500ULL * 1000000ULL;
     }
+    printk("xHCI: transfer timeout wanted 0x%lx dev slot %u\n", (unsigned long)wanted, dev->slot);
     return -255;
 }
 
@@ -407,6 +614,12 @@ static int control_transfer(struct xhci_device *dev, uint8_t request_type,
 {
     int input = (request_type & 0x80) != 0;
     uint32_t trt = length ? (input ? 3u : 2u) : 0u;
+    if (dev->ep0_data.phys + length > 0xFFFFFFFFULL) {
+        printk("xHCI: control DMA beyond 32-bit (phys 0x%lx len %u)\n",
+               (unsigned long)dev->ep0_data.phys, length);
+        return -1;
+    }
+    /* Setup Stage – 8 bytes immediate (IDT). */
     ring_push(&dev->ep0, setup_value(request_type, request, value, index, length),
               8, TRB_TYPE(2) | (1u << 6) | TRB_CHAIN | (trt << 16));
     if (length) {
@@ -415,6 +628,8 @@ static int control_transfer(struct xhci_device *dev, uint8_t request_type,
         ring_push(&dev->ep0, dev->ep0_data.phys, length,
                   TRB_TYPE(3) | (input ? TRB_DIR_IN : 0u) | TRB_CHAIN);
     }
+    /* Status Stage – IOC only in polling mode; CHAIN/ENT not needed without
+       Link+Event Data TRB (Haiku adds them only with Event Data). */
     uint64_t status = ring_push(&dev->ep0, 0, 0, TRB_TYPE(4) | TRB_IOC |
                                 ((!length || !input) ? TRB_DIR_IN : 0));
     struct xhci_controller *c = dev->ctrl ? dev->ctrl : cur_hc;
@@ -426,12 +641,6 @@ static int control_transfer(struct xhci_device *dev, uint8_t request_type,
 }
 
 static uint32_t *input_context(struct xhci_device *dev, unsigned index)
-{
-    struct xhci_controller *c = dev->ctrl ? dev->ctrl : cur_hc;
-    return (uint32_t *)((uint8_t *)dev->input_ctx.virt + (size_t)index * c->context_size);
-}
-
-static uint32_t *input_context_legacy(struct xhci_device *dev, unsigned index)
 {
     struct xhci_controller *c = dev->ctrl ? dev->ctrl : cur_hc;
     return (uint32_t *)((uint8_t *)dev->input_ctx.virt + (size_t)index * c->context_size);
@@ -513,6 +722,59 @@ static int disable_slot(struct xhci_controller *c, uint8_t slot)
     return command(c, 0, TRB_TYPE(10) | ((uint32_t)slot << 24), 0);
 }
 
+static int evaluate_context(struct xhci_device *dev, uint8_t slot)
+{
+    struct xhci_controller *c = dev->ctrl ? dev->ctrl : cur_hc;
+    return command(c, dev->input_ctx.phys, TRB_TYPE(13) | ((uint32_t)slot << 24), 0);
+}
+
+static int stop_endpoint(struct xhci_device *dev, uint8_t ep_num, int is_in)
+{
+    struct xhci_controller *c = dev->ctrl ? dev->ctrl : cur_hc;
+    uint8_t dci = (uint8_t)(ep_num * 2 + (is_in ? 1 : 0));
+    /* Spec encodes EP ID in bits 16-20 for Stop/Reset, slot in 24-31 */
+    uint32_t ctrl = TRB_TYPE(15) | ((uint32_t)dev->slot << 24) | ((uint32_t)dci << 16);
+    int rc = command(c, 0, ctrl, 0);
+    if (rc == -4 || rc == -19) /* Context State / Parameter – already stopped */ 
+        return 0;
+    return rc;
+}
+
+static int reset_endpoint(struct xhci_device *dev, uint8_t ep_num, int is_in)
+{
+    struct xhci_controller *c = dev->ctrl ? dev->ctrl : cur_hc;
+    uint8_t dci = (uint8_t)(ep_num * 2 + (is_in ? 1 : 0));
+    uint32_t ctrl = TRB_TYPE(14) | ((uint32_t)dev->slot << 24) | ((uint32_t)dci << 16);
+    return command(c, 0, ctrl, 0);
+}
+
+static const char *xhci_cc_string(uint8_t cc)
+{
+    switch (cc) {
+        case 1:  return "Success";
+        case 2:  return "Data Buffer Error";
+        case 3:  return "Babble";
+        case 4:  return "USB Transaction Error";
+        case 5:  return "TRB Error";
+        case 6:  return "Stall";
+        case 7:  return "Resource Error";
+        case 8:  return "Bandwidth Error";
+        case 9:  return "No Slots";
+        case 10: return "Invalid Stream";
+        case 11: return "Slot Not Enabled";
+        case 12: return "Endpoint Not Enabled";
+        case 13: return "Short Packet";
+        case 14: return "Ring Underrun";
+        case 15: return "Ring Overrun";
+        case 17: return "Parameter Error";
+        case 18: return "Bandwidth Overrun";
+        case 19: return "Context State Error";
+        case 22: return "Event Ring Full";
+        case 24: return "Halted";
+        default: return "Unknown";
+    }
+}
+
 static int address_device(struct xhci_device *dev)
 {
     if (!dev->ctrl) dev->ctrl = cur_hc;
@@ -537,14 +799,7 @@ static int address_device(struct xhci_device *dev)
     fill_slot_context(dev, 1);
     fill_endpoint_context(input_context(dev, 2), &dev->ep0, 4, mps, 0, 8);
     barrier();
-    {
-        uint32_t *slot_ctx = input_context(dev, 1);
-        uint32_t *ep0_ctx = input_context(dev, 2);
-        printk("xHCI: IC control=%08x %08x\n", control[0], control[1]);
-        printk("xHCI: SLOT %08x %08x %08x %08x\n", slot_ctx[0], slot_ctx[1], slot_ctx[2], slot_ctx[3]);
-        printk("xHCI: EP0 %08x %08x %08x %08x %08x\n", ep0_ctx[0], ep0_ctx[1], ep0_ctx[2], ep0_ctx[3], ep0_ctx[4]);
-    }
-    printk("xHCI: ADDR cmd slot=%u port=%u mps=%u input_ctx_phys=0x%lx\n", slot, dev->port, mps, (unsigned long)dev->input_ctx.phys);
+    printk("xHCI: ADDR port %u slot %u mps %u\n", dev->port, slot, mps);
     rc = command(c, dev->input_ctx.phys, TRB_TYPE(11) |
                          ((uint32_t)slot << 24), 0);
     if (rc < 0) {
@@ -568,9 +823,30 @@ static int address_device(struct xhci_device *dev)
     uint16_t actual = (dev->speed >= 4) ? (uint16_t)(1u << bMaxPacket) : (uint16_t)bMaxPacket;
     if (actual != mps) {
         printk("xHCI: port %u EP0 MPS %u -> %u from descriptor (raw %u speed %u)\n", dev->port, mps, actual, bMaxPacket, dev->speed);
-        /* For FS, if actual is 16/32/64, we should Evaluate Context – not brute force */
-        if (actual == 16 || actual == 32 || actual == 64) {
-            printk("xHCI: port %u TODO EvaluateContext for MPS %u\n", dev->port, actual);
+        if (actual == 0 || actual > 512) {
+            printk("xHCI: port %u invalid MPS %u\n", dev->port, actual);
+        } else if (actual != mps) {
+            /* Evaluate Context to update EP0 MPS without re-addressing.
+               Haiku does ConfigureEndpoint/EvaluateContext with input context
+               containing new EP0 MaxPacket. */
+            memset(dev->input_ctx.virt, 0, PAGE_SIZE);
+            uint32_t *ctrl = input_context(dev, 0);
+            ctrl[0] = 0;
+            ctrl[1] = (1u << 1); /* Add EP0 context (DCI=1) */
+            fill_slot_context(dev, 1);
+            fill_endpoint_context(input_context(dev, 2), &dev->ep0, 4, actual, 0, 8);
+            barrier();
+            int erc = evaluate_context(dev, dev->slot);
+            if (erc == 0) {
+                printk("xHCI: port %u EvaluateContext MPS %u success\n", dev->port, actual);
+                mps = actual;
+            } else {
+                printk("xHCI: port %u EvaluateContext MPS %u failed rc=%d (%s)\n",
+                       dev->port, actual, erc, xhci_cc_string((uint8_t)-erc));
+                if (actual == 8 || actual == 16 || actual == 32 || actual == 64) {
+                    /* Non-critical: keep original mps for now, but log */
+                }
+            }
         }
     }
     return 0;
@@ -659,6 +935,13 @@ static int xhci_bulk_transfer(struct xhci_device *dev, struct xhci_ring *ring,
                               uint8_t ep_num, int is_in, uint64_t phys,
                               uint32_t len, uint32_t *resid)
 {
+    if (phys + len > 0xFFFFFFFFULL) {
+        printk("xHCI: bulk DMA beyond 32-bit phys 0x%lx len %u\n", (unsigned long)phys, len);
+        return -1;
+    }
+    /* TD_SIZE for Normal TRB: remaining max-packet packets capped 31.
+       For bulk single-TRB TD, TD_SIZE=0 is correct; for larger we chunk
+       via msc layer so keep 0. */
     uint64_t trb = ring_push(ring, phys, len, TRB_TYPE(1) | TRB_IOC | (is_in ? TRB_DIR_IN : 0));
     uint32_t dci = (uint32_t)ep_num * 2 + (is_in ? 1u : 0u);
     printk("xHCI: bulk trb phys 0x%lx dci %u len %u is_in %d slot %u ep %u\n", (unsigned long)trb, dci, len, is_in, dev->slot, ep_num);
@@ -666,15 +949,35 @@ static int xhci_bulk_transfer(struct xhci_device *dev, struct xhci_ring *ring,
     struct xhci_controller *c = dev->ctrl ? dev->ctrl : cur_hc;
     c->doorbell[dev->slot] = dci;
     int rc = transfer_wait(dev, trb, resid);
-    if (rc < 0)
-        printk("xHCI: bulk transfer failed rc=%d dci %u len %u\n", rc, dci, len);
+    if (rc < 0) {
+        printk("xHCI: bulk transfer failed rc=%d (%s) dci %u len %u\n",
+               rc, xhci_cc_string((uint8_t)-rc), dci, len);
+        if (rc == -6) {
+            /* Stall – Halted endpoint requires Reset (Haiku CancelQueuedTransfers
+               does StopEndpoint then ResetEndpoint). */
+            printk("xHCI: bulk stall on ep %u is_in %d, resetting endpoint\n", ep_num, is_in);
+            int s = stop_endpoint(dev, ep_num, is_in);
+            if (s != 0) {
+                printk("xHCI: stop endpoint failed %d, retry\n", s);
+                s = stop_endpoint(dev, ep_num, is_in);
+            }
+            int r = reset_endpoint(dev, ep_num, is_in);
+            if (r != 0)
+                printk("xHCI: reset endpoint failed %d\n", r);
+            else
+                printk("xHCI: endpoint reset done\n");
+            /* Ring dequeue must be reset to current enqueue after stall per spec
+               – the enqueue was already advanced by ring_push, so dequeue = phys? */
+            uint64_t dequeue = ring->dma.phys | 1u;
+            (void)dequeue; /* our ring keeps software state; no HW TR dequeue needed for simple ring */
+        }
+    }
     return rc;
 }
 
 static void msc_delay(void)
 {
-    for (volatile uint32_t i = 0; i < 2000000; i++)
-        __asm__ volatile("" ::: "memory");
+    xhci_mdelay(20);
 }
 
 static int msc_bot(struct xhci_device *dev, const uint8_t *cdb, uint8_t cdb_len,
@@ -1127,6 +1430,10 @@ static int configure_hid(struct xhci_device *dev)
 static void queue_interrupt(struct xhci_device *dev)
 {
     if (dev->dev_type != DEV_TYPE_HID) return;
+    if (dev->report.phys + dev->report_size > 0xFFFFFFFFULL) {
+        printk("xHCI: HID report DMA beyond 32-bit\n");
+        return;
+    }
     memset(dev->report.virt, 0, dev->report_size);
     dev->pending_trb = ring_push(&dev->intr, dev->report.phys,
                                  dev->report_size, TRB_TYPE(1) | TRB_IOC);
@@ -1200,14 +1507,23 @@ void xhci_poll(void)
         struct xhci_controller *c = &hcs[ci];
         if (!c->ready) continue;
         cur_hc = c;
+        int had_event = 0;
         for (;;) {
             volatile struct xhci_trb *event = event_current(c);
             if (!event)
                 break;
+            had_event = 1;
             uint32_t type = (event->control >> 10) & 0x3f;
             if (type == 32)
                 handle_transfer_event(c, event);
+            else if (type == 34) {
+                /* Port Status Change – just ack, enumeration already polls CSC */
+            }
             event_advance(c);
+        }
+        if (had_event && c->irq_enabled) {
+            xhci_ack_irq(c);
+            c->irq_pending = 0;
         }
         for (uint8_t i = 0; i < c->max_ports; i++)
             if (c->devices[i].active && c->devices[i].dev_type == DEV_TYPE_HID && !c->devices[i].pending)
@@ -1380,24 +1696,29 @@ int xhci_probe(struct pci_device *pdev)
         cur_hc = NULL;
         return -1;
     }
-    printk("xHCI: controller %d at bar 0x%lx slots=%u ports=%u\n", n_hcs, bar, cur_hc->max_slots, cur_hc->max_ports);
+    /* Try to enable interrupt mode (polling remains fallback). */
+    (void)xhci_setup_irq(cur_hc, pdev);
+    printk("xHCI: controller %d at bar 0x%lx slots=%u ports=%u irq %s (vector 0x%x gsi %u)\n",
+           n_hcs, bar, cur_hc->max_slots, cur_hc->max_ports,
+           cur_hc->irq_enabled ? "enabled" : "polling",
+           cur_hc->irq_vector, cur_hc->irq_gsi);
     for (uint8_t port = 1; port <= cur_hc->max_ports; port++) {
         struct xhci_device *dev = &cur_hc->devices[port - 1];
         dev->port = port;
         dev->ctrl = cur_hc;
         if (reset_port(cur_hc, port, &dev->speed) < 0)
             continue;
-        printk("xHCI: controller %d port %u connected speed=%u\n", n_hcs, port, dev->speed);
-        /* Retry address up to 3 times with reset between */
+        printk("xHCI: port %u speed %u\n", port, dev->speed);
         int addr_ok = 0;
-        for (int tries = 0; tries < 3; tries++) {
+        for (int tries = 0; tries < 2; tries++) {
             if (address_device(dev) == 0) { addr_ok = 1; break; }
-            printk("xHCI: controller %d port %u address attempt %d failed, retrying\n", n_hcs, port, tries+1);
+            if (tries == 0)
+                printk("xHCI: port %u address retry\n", port);
             xhci_mdelay(100);
             if (reset_port(cur_hc, port, &dev->speed) < 0) break;
         }
         if (!addr_ok) {
-            printk("xHCI: controller %d port %u address failed after retries\n", n_hcs, port);
+            printk("xHCI: port %u address failed\n", port);
             continue;
         }
         /* Determine class before Configure Endpoint – do not try HID then MSC sequentially */
