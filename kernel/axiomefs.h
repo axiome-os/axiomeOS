@@ -90,4 +90,8 @@ struct axfs_dent {
    Returns 0 on success, -1 on failure. */
 int axiomefs_mount_part(int bus, int drive, int part, const char *mp);
 
+/* Mount axiomefs from a generic block_dev (e.g. USB MSC). */
+struct block_dev;
+int axiomefs_mount_block(struct block_dev *bd, int part, const char *mp);
+
 #endif

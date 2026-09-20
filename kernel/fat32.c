@@ -1,6 +1,7 @@
 #include "fat32.h"
 #include "vfs.h"
 #include "ide.h"
+#include "xhci.h"
 #include "io.h"
 #include "slab.h"
 #include "printk.h"
@@ -426,15 +427,26 @@ int fat32_mount_part(int bus, int drive, int part, const char *mp)
     int np = ide_read_partitions(bd, parts, IDE_MAX_PARTS);
     if (np > 0)
     {
-        if (part >= 0 && part < np &&
-            (parts[part].type == 0x0B || parts[part].type == 0x0C))
-            return fat32_try_mount(bd, parts[part].start_lba, mp) ? 0 : -1;
+        if (part >= 0 && part < np) {
+            uint8_t t = parts[part].type;
+            if (t == 0x0B || t == 0x0C || t == 0x0E || t == 0xEF) {
+                if (fat32_try_mount(bd, parts[part].start_lba, mp))
+                    return 0;
+                return -1;
+            }
+        }
         return -1;
     }
     /* No partition table: treat the whole device as a FAT32 volume. */
     if (part == 0)
         return fat32_try_mount(bd, 0, mp) ? 0 : -1;
     return -1;
+}
+
+static int fat32_is_fat_type(uint8_t t)
+{
+    return t == 0x01 || t == 0x04 || t == 0x06 || t == 0x0B || t == 0x0C ||
+           t == 0x0E || t == 0xEF;
 }
 
 void fat32_automount(void)
@@ -450,7 +462,7 @@ void fat32_automount(void)
             int np = ide_read_partitions(bd, parts, IDE_MAX_PARTS);
             for (int p = 0; p < np; p++)
             {
-                if (parts[p].type != 0x0B && parts[p].type != 0x0C)
+                if (!fat32_is_fat_type(parts[p].type))
                     continue;
                 if (fat32_try_mount(bd, parts[p].start_lba, "/boot"))
                     return; /* mounted the first FAT32 partition */
@@ -459,6 +471,27 @@ void fat32_automount(void)
             if (fat32_try_mount(bd, 0, "/boot"))
                 return;
         }
+    }
+    /* Try USB mass-storage (xHCI) devices as a fallback / primary when
+       booting from a flash drive. The xHCI driver exposes each flash drive
+       as a block_dev with BOT/SCSI translation, so the same FAT32 logic
+       applies (MBR parse + superfloppy). */
+    for (int i = 0; i < 16; i++)
+    {
+        struct block_dev *bd = xhci_get_block_dev(i);
+        if (!bd)
+            break;
+        struct partition parts[IDE_MAX_PARTS];
+        int np = ide_read_partitions(bd, parts, IDE_MAX_PARTS);
+        for (int p = 0; p < np; p++)
+        {
+            if (!fat32_is_fat_type(parts[p].type))
+                continue;
+            if (fat32_try_mount(bd, parts[p].start_lba, "/boot"))
+                return;
+        }
+        if (fat32_try_mount(bd, 0, "/boot"))
+            return;
     }
     printk("FAT32: no FAT32 volume found\n");
 }

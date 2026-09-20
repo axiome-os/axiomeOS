@@ -4,12 +4,18 @@
 #include <stdint.h>
 #include <stddef.h>
 
-/* A simple block device backed by a legacy ATA (PATA) drive accessed via PIO. */
+/* A simple block device backed by a legacy ATA (PATA) drive accessed via PIO,
+   or by a USB mass-storage device (when ops are set). */
 struct block_dev {
     int bus;             /* 0 = primary (0x1F0), 1 = secondary (0x170) */
     int drive;           /* 0 = master, 1 = slave */
     uint64_t total_sectors;
     int present;
+    /* Optional override for non-IDE transports (USB MSC). When non-NULL,
+       blk_read/blk_write dispatch through these instead of ATA PIO. */
+    int (*read_fn)(struct block_dev *bd, uint64_t lba, uint32_t count, void *buf);
+    int (*write_fn)(struct block_dev *bd, uint64_t lba, uint32_t count, const void *buf);
+    void *priv;
 };
 
 /* One MBR partition entry of interest. */

@@ -528,7 +528,12 @@ int axiomefs_mount_part(int bus, int drive, int part, const char *mp)
     ide_probe(0, 0);
     struct block_dev *bd = ide_get_dev(bus, drive);
     if (!bd) return -1;
+    return axiomefs_mount_block(bd, part, mp);
+}
 
+int axiomefs_mount_block(struct block_dev *bd, int part, const char *mp)
+{
+    if (!bd || !bd->present) return -1;
     uint32_t start = 0;
     if (part > 0)
     {
@@ -537,17 +542,18 @@ int axiomefs_mount_part(int bus, int drive, int part, const char *mp)
         if (part < np) start = parts[part].start_lba;
         else return -1;
     }
-
     uint8_t blk[AXFS_BLOCK_SIZE];
     if (blk_read(bd, (uint64_t)start, AXFS_SECTORS_PER_BLOCK, blk) != 0)
         return -1;
     struct axfs_super *s = (struct axfs_super *)blk;
     if (__builtin_memcmp(s->magic, AXFS_MAGIC, 8) != 0)
     {
-        printk("axiomefs: bad magic at bus %d drive %d\n", bus, drive);
+        if (bd->bus == 99)
+            printk("axiomefs: bad magic on USB block (start %u)\n", start);
+        else
+            printk("axiomefs: bad magic at bus %d drive %d\n", bd->bus, bd->drive);
         return -1;
     }
-
     struct axfs_state *st = kmalloc(sizeof(*st));
     if (!st) return -1;
     __builtin_memset(st, 0, sizeof(*st));
@@ -557,7 +563,6 @@ int axiomefs_mount_part(int bus, int drive, int part, const char *mp)
     st->root_inode_block = s->root_inode;
     st->free_bitmap_block = s->free_bitmap_block;
     st->transaction_id = s->transaction_id + 1;
-
     struct vfs_super *sb = vfs_mount(mp, FS_AXIOMEFS, &g_axfs_ops, st);
     if (!sb) { kfree(st); return -1; }
     st->root = axfs_make_vnode(sb, st, st->root_inode_block);

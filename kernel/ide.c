@@ -64,6 +64,8 @@ int blk_read(struct block_dev *bd, uint64_t lba, uint32_t count, void *buf)
 {
     if (!bd || !bd->present || count == 0)
         return -1;
+    if (bd->read_fn)
+        return bd->read_fn(bd, lba, count, buf);
     uint16_t base = base_port(bd->bus);
     uint16_t ctrl = ctrl_port(bd->bus);
     uint8_t *p = (uint8_t *)buf;
@@ -228,6 +230,8 @@ int blk_write(struct block_dev *bd, uint64_t lba, uint32_t count, const void *bu
 {
     if (!bd || !bd->present || count == 0)
         return -1;
+    if (bd->write_fn)
+        return bd->write_fn(bd, lba, count, buf);
     uint16_t base = base_port(bd->bus);
     uint16_t ctrl = ctrl_port(bd->bus);
     const uint8_t *p = (const uint8_t *)buf;

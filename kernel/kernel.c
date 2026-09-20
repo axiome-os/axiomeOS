@@ -201,8 +201,15 @@ void kmain(struct axboot_info *info)
 
     /* Mount the axiomefs persistent root from partition 1 of the boot disk
        (second MBR partition, 0-indexed) and parse /etc/passwd into the
-       in-kernel user database. */
-    axiomefs_mount_part(0, 0, 1, "/");
+       in-kernel user database. Try IDE first, then USB MSC (flash drive). */
+    if (axiomefs_mount_part(0, 0, 1, "/") != 0) {
+        for (int i = 0; i < 16; i++) {
+            struct block_dev *bd = xhci_get_block_dev(i);
+            if (!bd) break;
+            if (axiomefs_mount_block(bd, 1, "/") == 0)
+                break;
+        }
+    }
     security_init();
 
     klog_init_late();
