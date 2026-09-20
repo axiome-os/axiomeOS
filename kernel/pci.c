@@ -23,6 +23,48 @@ void pci_write32(uint8_t bus, uint8_t dev, uint8_t func, uint8_t off, uint32_t v
     outl(PCI_DATA_PORT, val);
 }
 
+uint16_t pci_read16(uint8_t bus, uint8_t dev, uint8_t func, uint8_t off)
+{
+    uint32_t addr = 0x80000000u | ((uint32_t)bus << 16) |
+                    ((uint32_t)dev << 11) | ((uint32_t)func << 8) | (off & 0xFFFC);
+    outl(PCI_ADDR_PORT, addr);
+    return (uint16_t)inw(PCI_DATA_PORT);
+}
+
+void pci_write16(uint8_t bus, uint8_t dev, uint8_t func, uint8_t off, uint16_t val)
+{
+    uint32_t addr = 0x80000000u | ((uint32_t)bus << 16) |
+                    ((uint32_t)dev << 11) | ((uint32_t)func << 8) | (off & 0xFFFC);
+    outl(PCI_ADDR_PORT, addr);
+    outw(PCI_DATA_PORT, val);
+}
+
+uint8_t pci_read8(uint8_t bus, uint8_t dev, uint8_t func, uint8_t off)
+{
+    uint32_t addr = 0x80000000u | ((uint32_t)bus << 16) |
+                    ((uint32_t)dev << 11) | ((uint32_t)func << 8) | (off & 0xFC);
+    outl(PCI_ADDR_PORT, addr);
+    uint32_t data = inl(PCI_DATA_PORT);
+    switch (off & 3) {
+        case 0: return data & 0xFF;
+        case 1: return (data >> 8) & 0xFF;
+        case 2: return (data >> 16) & 0xFF;
+        default: return (data >> 24) & 0xFF;
+    }
+}
+
+void pci_write8(uint8_t bus, uint8_t dev, uint8_t func, uint8_t off, uint8_t val)
+{
+    uint32_t addr = 0x80000000u | ((uint32_t)bus << 16) |
+                    ((uint32_t)dev << 11) | ((uint32_t)func << 8) | (off & 0xFC);
+    outl(PCI_ADDR_PORT, addr);
+    uint32_t data = inl(PCI_DATA_PORT);
+    uint32_t shift = (off & 3) * 8;
+    data &= ~(0xFFu << shift);
+    data |= (uint32_t)val << shift;
+    outl(PCI_DATA_PORT, data);
+}
+
 static void pci_add(uint8_t bus, uint8_t dev, uint8_t func)
 {
     uint32_t id = pci_read32(bus, dev, func, 0x00);

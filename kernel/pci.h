@@ -34,6 +34,18 @@ uint32_t pci_read32(uint8_t bus, uint8_t dev, uint8_t func, uint8_t off);
 /* Write a 32-bit configuration dword. */
 void pci_write32(uint8_t bus, uint8_t dev, uint8_t func, uint8_t off, uint32_t val);
 
+/* Read a 16-bit configuration halfword. */
+uint16_t pci_read16(uint8_t bus, uint8_t dev, uint8_t func, uint8_t off);
+
+/* Write a 16-bit configuration halfword. */
+void pci_write16(uint8_t bus, uint8_t dev, uint8_t func, uint8_t off, uint16_t val);
+
+/* Read a 8-bit configuration byte. */
+uint8_t pci_read8(uint8_t bus, uint8_t dev, uint8_t func, uint8_t off);
+
+/* Write a 8-bit configuration byte. */
+void pci_write8(uint8_t bus, uint8_t dev, uint8_t func, uint8_t off, uint8_t val);
+
 /* Enumerate the PCI bus(es) and print discovered devices. */
 void pci_init(void);
 

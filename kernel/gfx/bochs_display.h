@@ -5,11 +5,11 @@
 
 namespace gfx {
 
-/* QEMU std/VGA (Bochs VBE, PCI 1234:1111) + virtio-gpu stub (1AF4:1050).
-   Same staging story as IntelDisplay: probe now, delegate scanout to GOP
-   until a native modeset lands. Priority sits between GOP and Intel so a
-   future Bochs modeset beats GOP on QEMU but still loses to real Intel HW
-   when both are present. */
+/* QEMU std/VGA (Bochs VBE, PCI 1234:1111).
+    Same staging story as IntelDisplay: probe now, delegate scanout to GOP
+    until a native modeset lands. Priority sits between GOP and Intel so a
+    future Bochs modeset beats GOP on QEMU but still loses to real Intel HW
+    when both are present. */
 class BochsDisplay : public IDisplay {
 public:
     BochsDisplay();
@@ -22,7 +22,7 @@ public:
     void clear(uint32_t rgb) override;
     void fill_rect(const GfxRect &r, uint32_t rgb) override;
     void blit(const GfxRect &dst, const uint32_t *src,
-              uint32_t src_pitch_px) override;
+               uint32_t src_pitch_px) override;
     void present() override;
     void *cpu_base() override { return nullptr; }
     uint32_t fb_width() const override { return shadow_.width; }
@@ -32,7 +32,6 @@ public:
 
 private:
     bool found_ = false;
-    bool is_virtio_ = false;
     GfxMode shadow_;
 };
 

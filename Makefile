@@ -126,28 +126,33 @@ run: disk.img
 	qemu-system-x86_64 -bios /usr/share/ovmf/OVMF.fd \
 		-drive file=$(BUILD_DIR)/disk.img,format=raw,if=ide,index=0,media=disk \
 		-m 512M -serial stdio -display sdl \
+		-vga virtio \
 		-netdev user,id=net0 \
-		-device e1000,netdev=net0
+		-device virtio-net-pci,netdev=net0
 
 run-iso: iso disk.img
 	qemu-system-x86_64 -bios /usr/share/ovmf/OVMF.fd \
 		-cdrom $(BUILD_DIR)/axiome.iso \
 		-drive file=$(BUILD_DIR)/disk.img,format=raw,if=ide,index=0,media=disk \
 		-m 512M -serial stdio -display sdl \
+		-vga virtio \
 		-netdev user,id=net0 \
-		-device e1000,netdev=net0
+		-device virtio-net-pci,netdev=net0
 
 run-fb: disk.img
 	qemu-system-x86_64 -bios /usr/share/ovmf/OVMF.fd \
 		-drive file=$(BUILD_DIR)/disk.img,format=raw,if=ide,index=0,media=disk \
-		-m 512M -serial stdio -vga std -display sdl
+		-m 512M -serial stdio -vga virtio -display sdl
 
 run-usb: disk.img
 	qemu-system-x86_64 -bios /usr/share/ovmf/OVMF.fd \
 		-drive file=$(BUILD_DIR)/disk.img,format=raw,if=ide,index=0,media=disk \
 		-m 512M -serial stdio -display sdl \
+		-vga virtio \
 		-device qemu-xhci,id=xhci -device usb-kbd,bus=xhci.0 \
-		-device usb-mouse,bus=xhci.0
+		-device usb-mouse,bus=xhci.0 \
+		-netdev user,id=net0 \
+		-device virtio-net-pci,netdev=net0
 
 # ---------------------------------------------------------------------------
 # Host-side unit tests.  Each test compiles the real kernel/userspace sources
@@ -172,7 +177,7 @@ LIBC_TESTS := \
 	$(BUILD_DIR)/tests/libc_time_test \
 	$(BUILD_DIR)/tests/libc_stdio_test
 
-TEST_BINS := $(KERNEL_TESTS) $(LIBC_TESTS) $(BUILD_DIR)/tests/gfx_clip_test $(BUILD_DIR)/tests/axdri_cmd_test $(BUILD_DIR)/tests/input_abi_test $(BUILD_DIR)/tests/wm_abi_test
+TEST_BINS := $(KERNEL_TESTS) $(LIBC_TESTS) $(BUILD_DIR)/tests/gfx_clip_test $(BUILD_DIR)/tests/axdri_cmd_test $(BUILD_DIR)/tests/input_abi_test $(BUILD_DIR)/tests/wm_abi_test $(BUILD_DIR)/tests/virtio_gpu_test
 
 .PHONY: test test-hid
 
@@ -274,3 +279,7 @@ clean:
 
 distclean:
 	rm -rf $(BUILD_DIR)
+
+$(BUILD_DIR)/tests/virtio_gpu_test: tests/virtio_gpu_test.c kernel/virtio_gpu.h
+	@mkdir -p $(@D)
+	$(HOSTCC) $(TEST_CFLAGS) $(KERNEL_INC) -o $@ $<

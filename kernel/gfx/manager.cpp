@@ -6,6 +6,7 @@ extern "C" {
 #include "gop_display.h"
 #include "intel_display.h"
 #include "bochs_display.h"
+#include "virtio_gpu_display.h"
 #include "../printk.h"
 #include "../hal/hal_bootinfo.h"
 
@@ -86,6 +87,7 @@ extern "C" void gfx_init(void)
     gfx::DisplayManager &m = gfx::display_manager();
     /* Registration order is irrelevant; select_best() uses priority(). */
     m.reg(gfx::gop_display_create());
+    m.reg(gfx::virtio_gpu_display_create());
     m.reg(gfx::bochs_display_create());
     m.reg(gfx::intel_display_create());
     m.select_best();

@@ -19,14 +19,10 @@ bool BochsDisplay::probe()
 {
     struct pci_device *p = pci_first();
     for (; p; p = p->next) {
-        bool bochs = (p->vendor == 0x1234 && p->device == 0x1111);
-        bool virtio_gpu = (p->vendor == 0x1AF4 && p->device == 0x1050);
-        if (bochs || virtio_gpu) {
+        if (p->vendor == 0x1234 && p->device == 0x1111) {
             found_ = true;
-            is_virtio_ = virtio_gpu;
-            printk("gfx: %s at %02x:%02x.%u (stub, scanout stays on GOP)\n",
-                   virtio_gpu ? "virtio-gpu" : "bochs-vga", p->bus, p->dev,
-                   p->func);
+            printk("gfx: bochs-vga at %02x:%02x.%u (stub, scanout stays on GOP)\n",
+                   p->bus, p->dev, p->func);
             return true;
         }
     }
