@@ -13,6 +13,7 @@
    builtins all belong to /bin/sh. */
 
 #include "axclient.h"
+#include "axmui/axmui.h"
 #include "errno.h"
 #include "signal.h"
 
@@ -843,7 +844,22 @@ static int shell_spawn(struct shell_session *s, int uid, int gid, int evfd)
     return 0;
 }
 
-/* ---- compositor client mode (`axterm --wm ...`) ---- */
+/* ---- compositor client mode (`axterm --wm ...`) — axmui edition ----
+ * Still spawns /bin/sh with the same pipe discipline (helper for input,
+ * supervisor for rendering) but the supervisor now renders through axmui:
+ * HTML describes the chrome (header + card + terminal container), CSS styles
+ * it, and the terminal grid itself is a custom-draw view inside that layout.
+ * No WebKit — every pixel is native software raster.
+ */
+static struct term_state *g_term_for_draw;
+
+static void axmui_term_draw(struct axgui_fb *fb, axmui_view_t *view, void *ud){
+    struct term_state *t=(struct term_state*)ud;
+    if(!t||!fb||!view) return;
+    int x0=view->abs_x + view->style.border_w + view->style.padding[3];
+    int y0=view->abs_y + view->style.border_w + view->style.padding[0];
+    term_draw(fb,t,x0,y0);
+}
 
 /* Keyboard pump: the only reader of the compositor event pipe. Forwards
    keystrokes to the shell, then tears the shell session down when the
@@ -861,7 +877,7 @@ static void window_keyboard_pump(int evfd, int shell_in, long shell_pid)
             continue;
         n = term_key_bytes(ev.code, seq);
         if (n > 0 && write_all(shell_in, seq, (size_t)n) < 0)
-            break; /* shell side gone: unwind instead of spinning */
+            break;
     }
     kill_process_tree(shell_pid);
     close(shell_in);
@@ -883,8 +899,6 @@ static int run_wm_client(struct axclient *cx, char **cargv, int cargc,
     int out_eof = 0;
     int closing = 0;
 
-    /* axclient_init (in main) already sanitised fds, attached the window
-       and checked the generation: the header is valid from here on. */
     if (shell_spawn(&sh, uid, gid, evfd) < 0)
     {
         printf("axterm-wm: cannot start /bin/sh\n");
@@ -915,21 +929,40 @@ static int run_wm_client(struct axclient *cx, char **cargv, int cargc,
     }
     if (helper == 0)
     {
-        /* Keyboard helper owns the event pipe and the shell's stdin. */
         close(sh.from_shell);
         window_keyboard_pump(evfd, sh.to_shell, sh.pid);
         sys_exit(0);
     }
-    /* Session supervisor/renderer: sole reader of shell output. Closing our
-       copies leaves exactly one reader/writer on each session pipe. */
     close(sh.to_shell);
     close(evfd);
 
-    term_init(&term, (int)cx->fb.w / FONT_WIDTH,
-              ((int)cx->fb.h - 8) / FONT_HEIGHT);
-    term_status(&term, "axiome terminal - /bin/sh");
+    /* axmui chrome around the terminal */
+    axmui_app_t *app=axmui_app_create();
+    axmui_window_t *win=axmui_window_create(app,"Terminal", WM_WIN_W, WM_WIN_H);
+    if(!win){ kill_process_tree(sh.pid); return 1; }
+    /* attach to the already-validated window SHM */
+    axmui_window_attach(win, cx);
+
+    int cols = (WM_WIN_W - 16) / FONT_WIDTH;
+    int rows = (WM_WIN_H - 16) / FONT_HEIGHT;
+    if(cols<8) cols=8; if(rows<4) rows=4;
+    term_init(&term, cols, rows);
+
+    const char *html =
+        "<div id='term' style='flex:1; background:#101418; padding:8px'></div>";
+    const char *css = ".window{ padding:0; gap:0; background:#101418; }";
+    axmui_window_set_html(win, html, css);
+    axmui_view_t *termView=axmui_view_find(axmui_window_root(win),"term");
+    if(termView){
+        axmui_view_set_draw(termView, axmui_term_draw, &term);
+        /* ensure term view expands */
+        termView->style.flex_grow=1;
+    }
+
+    /* first frame */
+    g_term_for_draw=&term;
     axclient_begin(cx);
-    term_draw(&cx->fb, &term, 8, 4);
+    axmui_window_render(win);
     cx->hdr->ready = 1;
     axclient_commit(cx);
 
@@ -940,7 +973,7 @@ static int run_wm_client(struct axclient *cx, char **cargv, int cargc,
         {
             term_feed(&term, out, (size_t)n);
             axclient_begin(cx);
-            term_draw(&cx->fb, &term, 8, 4);
+            axmui_window_render(win);
             axclient_commit(cx);
         }
         else if (n == 0)
@@ -961,8 +994,6 @@ static int run_wm_client(struct axclient *cx, char **cargv, int cargc,
             hq = sys_waitpid_nb((int)helper, 0);
             if (hq == helper || (hq < 0 && errno == ECHILD))
             {
-                /* No input path remains; unwind instead of buffering keys
-                   for a dead reader. */
                 helper_gone = 1;
                 closing = 1;
             }
@@ -978,11 +1009,10 @@ static int run_wm_client(struct axclient *cx, char **cargv, int cargc,
                 char done[64];
                 shell_gone = 1;
                 shell_status = st;
-                snprintf(done, sizeof(done), "[shell exited, status %d]",
-                         st);
+                snprintf(done, sizeof(done), "[shell exited, status %d]", st);
                 term_status(&term, done);
                 axclient_begin(cx);
-                term_draw(&cx->fb, &term, 8, 4);
+                axmui_window_render(win);
                 axclient_commit(cx);
             }
             else if (q < 0 && errno == ECHILD)
@@ -996,18 +1026,15 @@ static int run_wm_client(struct axclient *cx, char **cargv, int cargc,
             break;
         if (out_eof && !shell_gone)
         {
-            /* The shell closed stdout but has not exited (or left a child
-               holding it): unwind the session instead of spinning. */
             kill_process_tree(sh.pid);
             if (reap_child_deadline(sh.pid, &shell_status, 2000) == 0)
             {
                 char done[64];
                 shell_gone = 1;
-                snprintf(done, sizeof(done), "[shell exited, status %d]",
-                         shell_status);
+                snprintf(done, sizeof(done), "[shell exited, status %d]", shell_status);
                 term_status(&term, done);
                 axclient_begin(cx);
-                term_draw(&cx->fb, &term, 8, 4);
+                axmui_window_render(win);
                 axclient_commit(cx);
                 break;
             }
@@ -1016,18 +1043,15 @@ static int run_wm_client(struct axclient *cx, char **cargv, int cargc,
     }
 
     axclient_begin(cx);
-    term_draw(&cx->fb, &term, 8, 4);
+    axmui_window_render(win);
     axclient_commit(cx);
     close(sh.from_shell);
     if (helper > 0)
     {
-        /* The helper blocks in the event read and may outlive the shell
-           (plain `exit` keeps the window open with no input path). SIGKILL
-           reaches it promptly, so this blocking reap always terminates
-           and no pump process is ever orphaned. */
         kill((int)helper, SIGKILL);
         sys_waitpid((int)helper, 0);
     }
+    if(app) axmui_app_destroy(app);
     return shell_status;
 }
 
