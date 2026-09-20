@@ -261,7 +261,9 @@ static void scan_apps(void)
             continue;
         if (strcmp(nm, "init") == 0 || strcmp(nm, "syslogd") == 0 ||
             strcmp(nm, "oobe") == 0 || strcmp(nm, "login") == 0 ||
-            strcmp(nm, "axwm") == 0 || strcmp(nm, "evtest") == 0)
+            strcmp(nm, "axwm") == 0 || strcmp(nm, "guixd") == 0 ||
+            strcmp(nm, "axlogin") == 0 || strcmp(nm, "axoobe") == 0 ||
+            strcmp(nm, "evtest") == 0)
             continue;
         strncpy(g_apps[g_napps], nm, 63);
         g_apps[g_napps][63] = 0;
@@ -683,7 +685,9 @@ int main(int argc, char **argv)
         }
         g_prev_btn = g_btn;
 
-        /* Reap exited clients without stalling the frame loop. */
+        /* Reap exited clients without stalling the frame loop.
+           Clean exit (status 0) closes instantly; crashes keep a dead
+           frame until dismissed, matching guixd behaviour. */
         for (i = 0; i < (int)WM_MAX_WIN; i++)
         {
             struct win *w = &g_wins[i];
@@ -693,13 +697,44 @@ int main(int argc, char **argv)
                 long r = sys_waitpid_nb((int)w->pid, &st);
                 if (r == w->pid)
                 {
-                    w->pid = -1;
-                    w->dead = 1;
-                    w->status = st;
                     if (w->evfd >= 0)
                     {
                         close(w->evfd);
                         w->evfd = -1;
+                    }
+                    w->pid = -1;
+                    if (st == 0)
+                    {
+                        int k, j;
+                        w->used = 0;
+                        w->dead = 0;
+                        w->dragging = 0;
+                        if (g_drag_win == (int)(w - g_wins))
+                            g_drag_win = -1;
+                        k = 0;
+                        for (j = 0; j < g_nz; j++)
+                        {
+                            if (&g_wins[g_z[j]] != w)
+                                g_z[k++] = g_z[j];
+                        }
+                        g_nz = k;
+                        /* Re-elect focus so input does not stick on freed slot. */
+                        for (j = 0; j < (int)WM_MAX_WIN; j++)
+                            g_wins[j].focused = 0;
+                        for (j = g_nz - 1; j >= 0; j--)
+                        {
+                            struct win *t = &g_wins[g_z[j]];
+                            if (t->used && !t->dead)
+                            {
+                                t->focused = 1;
+                                break;
+                            }
+                        }
+                    }
+                    else
+                    {
+                        w->dead = 1;
+                        w->status = st;
                     }
                 }
             }

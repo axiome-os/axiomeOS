@@ -457,7 +457,7 @@ static struct win *open_login(struct axgui_fb *fb)
 }
 
 /* Open the GUI first-boot setup window (axoobe). */
-static struct win *open_setup(struct axgui_fb *fb)
+static __attribute__((unused)) struct win *open_setup(struct axgui_fb *fb)
 {
     struct win *w = open_client("First-boot setup", "axoobe", 0, -1, -1,
                                 fb);
@@ -685,18 +685,6 @@ static int handle_click(int x, int y, struct axgui_fb *fb, int input_fd,
         if (idx == row++)
         {
             open_client("System info", "axinfo", 0, -1, -1, fb);
-            g_menu = 0;
-            return 1;
-        }
-        if (idx == row++)
-        {
-            open_login(fb);
-            g_menu = 0;
-            return 1;
-        }
-        if (idx == row++)
-        {
-            open_setup(fb);
             g_menu = 0;
             return 1;
         }
@@ -962,7 +950,7 @@ static void render(struct axgui_fb *fb)
     }
     if (!has_fullscreen() && g_menu)
     {
-        int mh = (7 + g_napps + 1) * FONT_HEIGHT + 8;
+        int mh = (5 + g_napps + 1) * FONT_HEIGHT + 8;
         int my = TOPBAR + 2;
         int row = 0;
         axgui_fill(fb, 4, my, 240, mh, D_Menu);
@@ -970,10 +958,6 @@ static void render(struct axgui_fb *fb)
         axgui_text(fb, "+ New terminal", 12, my + 4 + row++ * FONT_HEIGHT,
                    D_Prompt, D_Menu);
         axgui_text(fb, "= System info", 12, my + 4 + row++ * FONT_HEIGHT,
-                   D_FG, D_Menu);
-        axgui_text(fb, "L Login", 12, my + 4 + row++ * FONT_HEIGHT,
-                   D_Prompt, D_Menu);
-        axgui_text(fb, "F First-boot setup", 12, my + 4 + row++ * FONT_HEIGHT,
                    D_FG, D_Menu);
         axgui_text(fb, "* gfx demo (fullscreen)", 12,
                    my + 4 + row++ * FONT_HEIGHT, D_FG, D_Menu);
@@ -1290,6 +1274,14 @@ int main(int argc, char **argv)
                             win_elect_focus();
                         }
                     }
+                }
+                else if (st == 0)
+                {
+                    /* Clean exit: close instantly instead of keeping a
+                       dead frame until the user presses X. */
+                    if (chained)
+                        g_queued_login = 1;
+                    win_free_slot(w);
                 }
                 else
                 {
