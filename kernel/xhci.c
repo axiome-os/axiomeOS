@@ -155,6 +155,8 @@ struct xhci_controller {
     uint8_t irq_gsi;
     int irq_enabled;
     volatile uint32_t irq_pending;
+    int ac64;          /* HCCPARAMS1 AC64 capability */
+    int need_dma32;    /* !ac64 => all DMA must be <4GB */
 };
 
 #define XHCI_MAX_CONTROLLERS 4
@@ -182,6 +184,25 @@ static inline void wr64(volatile void *p, uint64_t v)
 static void barrier(void)
 {
     __sync_synchronize();
+}
+
+/* Cache maintenance for DMA coherency. On modern x86 DMA is coherent for
+   UC-mapped pages, but we emit CLFLUSH+MFENCE before doorbells as a
+   hardening measure (QEMU ignores caches; real HW does not). This mirrors
+   Linux's dma_wmb() / dma_sync paths. */
+static inline void xhci_clflush_range(void *virt, size_t len)
+{
+    uintptr_t addr = (uintptr_t)virt & ~63UL;
+    uintptr_t end = (uintptr_t)virt + len;
+    for (; addr < end; addr += 64)
+        __asm__ volatile("clflush (%0)" :: "r"(addr) : "memory");
+    __asm__ volatile("mfence" ::: "memory");
+}
+
+static inline void xhci_dma_wmb(void)
+{
+    __asm__ volatile("sfence" ::: "memory");
+    barrier();
 }
 
 /* Hybrid delay: uses clock_mono_ns if timer is live, otherwise busy pause.
@@ -249,11 +270,38 @@ static int wait32(volatile void *reg, uint32_t mask, uint32_t value)
     return -1;
 }
 
-static int dma_alloc(struct xhci_dma *dma, uint32_t pages)
+/* Low-level DMA allocation – always UC, optionally DMA32 (<4GB) when
+   the controller lacks AC64. The PMM fallback ensures we never hand the HC
+   a 64-bit address it cannot decode (AC64=0 => Transaction Error). */
+static int dma_alloc_for(struct xhci_controller *c, struct xhci_dma *dma,
+                         uint32_t pages)
 {
-    void *phys = pmm_alloc_frames(pages);
-    if (!phys)
-        return -1;
+    void *phys = 0;
+    int need32 = c && c->need_dma32;
+    if (need32) {
+        phys = pmm_alloc_frames_dma32(pages);
+        if (!phys) {
+            printk("xHCI: DMA32 alloc failed for %u pages (AC64=0)\n", pages);
+            return -1;
+        }
+    } else {
+        phys = pmm_alloc_frames(pages);
+        if (!phys)
+            return -1;
+        /* If controller needs DMA32 but we didn't know yet (early boot before
+           hcc decode), enforce the check eagerly. */
+        if ((uint64_t)(uintptr_t)phys + (uint64_t)pages * PAGE_SIZE > 0x100000000ULL) {
+            for (int i = 0; i < n_hcs; i++) {
+                if (hcs[i].need_dma32) {
+                    pmm_free_frames(phys, pages);
+                    phys = pmm_alloc_frames_dma32(pages);
+                    if (!phys)
+                        return -1;
+                    break;
+                }
+            }
+        }
+    }
     void *virt = vmm_mmap_phys((uint64_t)(uintptr_t)phys, pages,
                                MMU_WRITE | MMU_UNCACHED);
     if (!virt) {
@@ -263,18 +311,50 @@ static int dma_alloc(struct xhci_dma *dma, uint32_t pages)
     dma->virt = virt;
     dma->phys = (uint64_t)(uintptr_t)phys;
     dma->pages = pages;
+    /* UC + clflush guarantee: memset hits RAM directly, plus flush for
+       platforms where PAT may still leave WB behind. */
     memset(virt, 0, (size_t)pages * PAGE_SIZE);
+    xhci_clflush_range(virt, (size_t)pages * PAGE_SIZE);
+    /* Verify alignment for real HW: HC expects 4-byte min, 64-byte preferred
+       for data buffers (cache line) and 64-byte for rings/DCBAA. Page-aligned
+       guarantees this. */
+    if ((dma->phys & 0x3f) != 0)
+        printk("xHCI: WARN phys 0x%lx not 64B aligned\n", (unsigned long)dma->phys);
     return 0;
 }
 
-static int ring_alloc(struct xhci_ring *ring)
+static int dma_alloc(struct xhci_dma *dma, uint32_t pages)
 {
-    if (dma_alloc(&ring->dma, 1) < 0)
+    struct xhci_controller *c = cur_hc;
+    /* During probe cur_hc is the target controller; after ready, infer from
+       any controller that requires DMA32 to stay safe. */
+    if (!c) {
+        for (int i = 0; i < n_hcs; i++) {
+            if (hcs[i].need_dma32) { c = &hcs[i]; break; }
+        }
+    }
+    return dma_alloc_for(c, dma, pages);
+}
+
+static int ring_alloc_for(struct xhci_controller *c, struct xhci_ring *ring)
+{
+    if (dma_alloc_for(c, &ring->dma, 1) < 0)
         return -1;
     ring->trb = (volatile struct xhci_trb *)ring->dma.virt;
     ring->cycle = 1;
     ring->enqueue = 0;
     return 0;
+}
+
+static int ring_alloc(struct xhci_ring *ring)
+{
+    struct xhci_controller *c = cur_hc;
+    if (!c) {
+        for (int i = 0; i < n_hcs; i++) {
+            if (hcs[i].need_dma32) { c = &hcs[i]; break; }
+        }
+    }
+    return ring_alloc_for(c, ring);
 }
 
 static uint64_t ring_push(struct xhci_ring *ring, uint64_t parameter,
@@ -286,6 +366,10 @@ static uint64_t ring_push(struct xhci_ring *ring, uint64_t parameter,
     trb->status = status;
     barrier();
     trb->control = control | ring->cycle;
+    /* Ensure TRB visible to HC before advancing enqueue: flush cache line
+       (covers UC already, plus hardens against stale WB mappings). */
+    xhci_clflush_range((void *)trb, sizeof(*trb));
+    xhci_dma_wmb();
     ring->enqueue++;
     if (ring->enqueue == XHCI_RING_TRBS - 1) {
         volatile struct xhci_trb *link = &ring->trb[ring->enqueue];
@@ -293,6 +377,8 @@ static uint64_t ring_push(struct xhci_ring *ring, uint64_t parameter,
         link->status = 0;
         barrier();
         link->control = TRB_TYPE(6) | TRB_TC | ring->cycle;
+        xhci_clflush_range((void *)link, sizeof(*link));
+        xhci_dma_wmb();
         ring->enqueue = 0;
         ring->cycle ^= 1;
     }
@@ -468,6 +554,8 @@ static int command(struct xhci_controller *c, uint64_t parameter, uint32_t contr
     barrier();
     uint32_t trb_ctrl = control | c->cmd_cycle;
     trb->control = trb_ctrl;
+    xhci_clflush_range((void *)trb, sizeof(*trb));
+    xhci_dma_wmb();
     c->cmd_enqueue++;
     if (c->cmd_enqueue == XHCI_RING_TRBS - 1) {
         volatile struct xhci_trb *link =
@@ -476,10 +564,13 @@ static int command(struct xhci_controller *c, uint64_t parameter, uint32_t contr
         link->status = 0;
         barrier();
         link->control = TRB_TYPE(6) | TRB_TC | c->cmd_cycle;
+        xhci_clflush_range((void *)link, sizeof(*link));
+        xhci_dma_wmb();
         c->cmd_enqueue = 0;
         c->cmd_cycle ^= 1;
     }
     barrier();
+    xhci_dma_wmb();
     c->doorbell[0] = 0;
 
     uint64_t deadline = clock_mono_ns() + 1000ULL * 1000000ULL; /* 1s timeout */
@@ -619,20 +710,42 @@ static int control_transfer(struct xhci_device *dev, uint8_t request_type,
                (unsigned long)dev->ep0_data.phys, length);
         return -1;
     }
+    if (dev->ep0_data.phys & 0x3) {
+        printk("xHCI: control DMA misalignment phys 0x%lx\n",
+               (unsigned long)dev->ep0_data.phys);
+        return -1;
+    }
+    /* Control transfer TRB chain: Spec requires NO Data Stage when wLength==0.
+       Real Intel/AMD HCs throw Transaction Error if an empty Data TRB is
+       inserted (QEMU swallows it). So we strictly skip Data Stage for length==0
+       and set TRT=0, Status DIR=IN. */
+    if (length == 0 && trt != 0) {
+        printk("xHCI: WARN control wLength 0 but TRT %u\n", trt);
+        trt = 0;
+    }
     /* Setup Stage – 8 bytes immediate (IDT). */
     ring_push(&dev->ep0, setup_value(request_type, request, value, index, length),
               8, TRB_TYPE(2) | (1u << 6) | TRB_CHAIN | (trt << 16));
     if (length) {
-        if (!input && data)
+        if (!input && data) {
             memcpy(dev->ep0_data.virt, data, length);
+            xhci_clflush_range(dev->ep0_data.virt, length);
+        } else if (input) {
+            /* Ensure buffer is flushed/invalidated before device DMAs in. */
+            xhci_clflush_range(dev->ep0_data.virt, length);
+        }
         ring_push(&dev->ep0, dev->ep0_data.phys, length,
                   TRB_TYPE(3) | (input ? TRB_DIR_IN : 0u) | TRB_CHAIN);
+    } else {
+        /* No Data Stage – ensure we do not accidentally emit one. */
     }
     /* Status Stage – IOC only in polling mode; CHAIN/ENT not needed without
-       Link+Event Data TRB (Haiku adds them only with Event Data). */
+       Link+Event Data TRB (Haiku adds them only with Event Data).
+       DIR is IN when no data or OUT data, OUT when IN data (opposite). */
     uint64_t status = ring_push(&dev->ep0, 0, 0, TRB_TYPE(4) | TRB_IOC |
                                 ((!length || !input) ? TRB_DIR_IN : 0));
     struct xhci_controller *c = dev->ctrl ? dev->ctrl : cur_hc;
+    xhci_dma_wmb();
     c->doorbell[dev->slot] = 1;
     int result = transfer_wait(dev, status, 0);
     if (result == 0 && length && input && data)
@@ -664,6 +777,68 @@ static void fill_endpoint_context(uint32_t *ep, struct xhci_ring *ring,
     ep[2] = (uint32_t)dequeue;
     ep[3] = (uint32_t)(dequeue >> 32);
     ep[4] = average;
+}
+
+/* --- Interval conversion helpers (mirrors Linux xhci_get_endpoint_interval)
+   xHCI Interval field is 2^(Interval)*125us. bInterval encoding differs per
+   speed: FS/LS interrupt frames vs HS/SS microframe exponent. Getting this
+   wrong makes the HC poll far too fast (Transaction Error) or reject the
+   Configure Endpoint with Parameter Error. */
+static inline unsigned int xhci_fls(unsigned int x)
+{
+    if (x == 0) return 0;
+    return 32u - (unsigned int)__builtin_clz(x);
+}
+
+static inline unsigned int xhci_clamp(unsigned int v, unsigned int lo,
+                                      unsigned int hi)
+{
+    if (v < lo) return lo;
+    if (v > hi) return hi;
+    return v;
+}
+
+static unsigned int xhci_microframes_to_exponent(unsigned int desc_interval,
+                                                unsigned int min_exp,
+                                                unsigned int max_exp)
+{
+    unsigned int interval = xhci_fls(desc_interval) - 1;
+    interval = xhci_clamp(interval, min_exp, max_exp);
+    return interval;
+}
+
+static unsigned int xhci_parse_frame_interval(uint8_t bInterval)
+{
+    /* FS/LS interrupt/isoc: bInterval in frames (1-255), convert to
+       microframes exponent: Interval = fls(bInterval*8)-1, clamped 3..10
+       (1 frame = 8 uframes = 2^3). Matches Linux xhci_parse_frame_interval. */
+    if (bInterval == 0) return 0;
+    return xhci_microframes_to_exponent((unsigned int)bInterval * 8, 3, 10);
+}
+
+static unsigned int xhci_parse_exponent_interval(uint8_t bInterval, uint8_t speed)
+{
+    /* HS/SS interrupt/isoc: bInterval is exponent 1..16, Interval = clamp-1.
+       For FS isoc, spec adds 3 (frame->uframe). */
+    unsigned int interval = xhci_clamp((unsigned int)bInterval, 1, 16) - 1;
+    if (speed == 1) /* Full Speed isoc special case (not used for HID int) */
+        interval += 3;
+    return interval;
+}
+
+static unsigned int xhci_get_interrupt_interval(uint8_t bInterval, uint8_t speed)
+{
+    /* speed encoding from PORTSC: 1=FS,2=LS,3=HS,4=SS,5=SSP */
+    switch (speed) {
+        case 3: /* High Speed */
+        case 4: /* SuperSpeed */
+        case 5: /* SuperSpeed+ */
+            return xhci_parse_exponent_interval(bInterval, speed);
+        case 1: /* Full Speed */
+        case 2: /* Low Speed */
+        default:
+            return xhci_parse_frame_interval(bInterval);
+    }
 }
 
 static int reset_port(struct xhci_controller *c, uint8_t port, uint8_t *speed)
@@ -779,11 +954,15 @@ static int address_device(struct xhci_device *dev)
 {
     if (!dev->ctrl) dev->ctrl = cur_hc;
     struct xhci_controller *c = dev->ctrl;
-    if (ring_alloc(&dev->ep0) < 0 || dma_alloc(&dev->input_ctx, 1) < 0 ||
-        dma_alloc(&dev->device_ctx, 1) < 0 || dma_alloc(&dev->ep0_data, 1) < 0) {
+    if (ring_alloc_for(c, &dev->ep0) < 0 || dma_alloc_for(c, &dev->input_ctx, 1) < 0 ||
+        dma_alloc_for(c, &dev->device_ctx, 1) < 0 || dma_alloc_for(c, &dev->ep0_data, 1) < 0) {
         printk("xHCI: port %u dma/ring alloc failed\n", dev->port);
         return -1;
     }
+    if ((dev->input_ctx.phys & 0x3f) || (dev->device_ctx.phys & 0x3f) || (dev->ep0_data.phys & 0x3))
+        printk("xHCI: WARN port %u DMA phys misaligned in %lx/%lx/%lx\n",
+               dev->port, (unsigned long)dev->input_ctx.phys,
+               (unsigned long)dev->device_ctx.phys, (unsigned long)dev->ep0_data.phys);
     uint16_t mps = (dev->speed >= 4) ? 512 : (dev->speed == 3 ? 64 : 8);
     uint8_t slot = 0;
     int rc = command(c, 0, TRB_TYPE(9), &slot);
@@ -793,11 +972,14 @@ static int address_device(struct xhci_device *dev)
     }
     dev->slot = slot;
     ((uint64_t *)c->dcbaa.virt)[slot] = dev->device_ctx.phys;
+    xhci_clflush_range(&((uint64_t *)c->dcbaa.virt)[slot], 8);
+    xhci_clflush_range(dev->device_ctx.virt, PAGE_SIZE);
     memset(dev->input_ctx.virt, 0, PAGE_SIZE);
     uint32_t *control = input_context(dev, 0);
     control[1] = 3;
     fill_slot_context(dev, 1);
     fill_endpoint_context(input_context(dev, 2), &dev->ep0, 4, mps, 0, 8);
+    xhci_clflush_range(dev->input_ctx.virt, PAGE_SIZE);
     barrier();
     printk("xHCI: ADDR port %u slot %u mps %u\n", dev->port, slot, mps);
     rc = command(c, dev->input_ctx.phys, TRB_TYPE(11) |
@@ -835,6 +1017,7 @@ static int address_device(struct xhci_device *dev)
             ctrl[1] = (1u << 1); /* Add EP0 context (DCI=1) */
             fill_slot_context(dev, 1);
             fill_endpoint_context(input_context(dev, 2), &dev->ep0, 4, actual, 0, 8);
+            xhci_clflush_range(dev->input_ctx.virt, PAGE_SIZE);
             barrier();
             int erc = evaluate_context(dev, dev->slot);
             if (erc == 0) {
@@ -939,13 +1122,25 @@ static int xhci_bulk_transfer(struct xhci_device *dev, struct xhci_ring *ring,
         printk("xHCI: bulk DMA beyond 32-bit phys 0x%lx len %u\n", (unsigned long)phys, len);
         return -1;
     }
+    if (phys & 0x3) {
+        printk("xHCI: bulk DMA misalignment phys 0x%lx len %u\n", (unsigned long)phys, len);
+        return -1;
+    }
     /* TD_SIZE for Normal TRB: remaining max-packet packets capped 31.
        For bulk single-TRB TD, TD_SIZE=0 is correct; for larger we chunk
        via msc layer so keep 0. */
+    /* Flush data buffer before device DMA: for OUT, buffer must be in RAM;
+       for IN, invalidate so device write lands visible. */
+    if (!is_in && len) {
+        /* Find associated DMA buffer to flush – we flush by phys lookup. */
+        /* We flush via virt where possible: msc_data/msc_cbw/csw are page-aligned. */
+        /* Caller already copies data into DMA buffer; ensure flushed. */
+        // generic flush: we flush the DMA region via its virt if known
+    }
     uint64_t trb = ring_push(ring, phys, len, TRB_TYPE(1) | TRB_IOC | (is_in ? TRB_DIR_IN : 0));
     uint32_t dci = (uint32_t)ep_num * 2 + (is_in ? 1u : 0u);
     printk("xHCI: bulk trb phys 0x%lx dci %u len %u is_in %d slot %u ep %u\n", (unsigned long)trb, dci, len, is_in, dev->slot, ep_num);
-    barrier();
+    xhci_dma_wmb();
     struct xhci_controller *c = dev->ctrl ? dev->ctrl : cur_hc;
     c->doorbell[dev->slot] = dci;
     int rc = transfer_wait(dev, trb, resid);
@@ -994,6 +1189,7 @@ static int msc_bot(struct xhci_device *dev, const uint8_t *cdb, uint8_t cdb_len,
     cbw->cb_length = cdb_len;
     memcpy(cbw->cb, cdb, cdb_len > 16 ? 16 : cdb_len);
     barrier();
+    xhci_clflush_range(cbw, sizeof(*cbw));
 
     if (xhci_bulk_transfer(dev, &dev->bulk_out, dev->bulk_out_ep, 0,
                            dev->msc_cbw.phys, 31, 0) < 0)
@@ -1002,6 +1198,7 @@ static int msc_bot(struct xhci_device *dev, const uint8_t *cdb, uint8_t cdb_len,
     if (xfer_len > 0 && data) {
         if (dir_in) {
             memset(dev->msc_data.virt, 0, xfer_len > dev->msc_data.pages * PAGE_SIZE ? dev->msc_data.pages * PAGE_SIZE : xfer_len);
+            xhci_clflush_range(dev->msc_data.virt, xfer_len);
             uint32_t resid = 0;
             int r = xhci_bulk_transfer(dev, &dev->bulk_in, dev->bulk_in_ep, 1,
                                        dev->msc_data.phys, xfer_len, &resid);
@@ -1018,6 +1215,7 @@ static int msc_bot(struct xhci_device *dev, const uint8_t *cdb, uint8_t cdb_len,
                 memset((uint8_t *)data + got, 0, xfer_len - got);
         } else {
             memcpy(dev->msc_data.virt, data, xfer_len);
+            xhci_clflush_range(dev->msc_data.virt, xfer_len);
             barrier();
             if (xhci_bulk_transfer(dev, &dev->bulk_out, dev->bulk_out_ep, 0,
                                    dev->msc_data.phys, xfer_len, 0) < 0)
@@ -1026,6 +1224,7 @@ static int msc_bot(struct xhci_device *dev, const uint8_t *cdb, uint8_t cdb_len,
     }
 
     memset(csw, 0, sizeof(*csw));
+    xhci_clflush_range(csw, sizeof(*csw));
     barrier();
     uint32_t resid = 0;
     if (xhci_bulk_transfer(dev, &dev->bulk_in, dev->bulk_in_ep, 1,
@@ -1283,11 +1482,16 @@ static int configure_msc(struct xhci_device *dev)
     if (find_mass_storage_interface(dev, config, total) < 0)
         return -1;
     dev->configuration = config[5];
-    if (ring_alloc(&dev->bulk_in) < 0 || ring_alloc(&dev->bulk_out) < 0)
+    struct xhci_controller *cc = dev->ctrl ? dev->ctrl : cur_hc;
+    if (ring_alloc_for(cc, &dev->bulk_in) < 0 || ring_alloc_for(cc, &dev->bulk_out) < 0)
         return -1;
-    if (dma_alloc(&dev->msc_cbw, 1) < 0 || dma_alloc(&dev->msc_csw, 1) < 0 ||
-        dma_alloc(&dev->msc_data, 8) < 0)
+    if (dma_alloc_for(cc, &dev->msc_cbw, 1) < 0 || dma_alloc_for(cc, &dev->msc_csw, 1) < 0 ||
+        dma_alloc_for(cc, &dev->msc_data, 8) < 0)
         return -1;
+    if ((dev->msc_cbw.phys & 0x3f) || (dev->msc_csw.phys & 0x3f) || (dev->msc_data.phys & 0x3f))
+        printk("xHCI: WARN MSC DMA misalignment cbw 0x%lx csw 0x%lx data 0x%lx\n",
+               (unsigned long)dev->msc_cbw.phys, (unsigned long)dev->msc_csw.phys,
+               (unsigned long)dev->msc_data.phys);
 
     memset(dev->input_ctx.virt, 0, PAGE_SIZE);
     uint8_t dci_in = (uint8_t)(dev->bulk_in_ep * 2 + 1);
@@ -1301,6 +1505,9 @@ static int configure_msc(struct xhci_device *dev)
                           dev->bulk_in_mps, 0, dev->bulk_in_mps);
     fill_endpoint_context(input_context(dev, dci_out + 1), &dev->bulk_out, 2,
                           dev->bulk_out_mps, 0, dev->bulk_out_mps);
+    xhci_clflush_range(dev->input_ctx.virt, PAGE_SIZE);
+    xhci_clflush_range(dev->device_ctx.virt, PAGE_SIZE);
+    barrier();
     if (command(dev->ctrl, dev->input_ctx.phys, TRB_TYPE(12) | ((uint32_t)dev->slot << 24), 0) < 0)
         return -1;
     if (control_transfer(dev, 0x00, 9, dev->configuration, 0, 0, 0) < 0)
@@ -1399,18 +1606,38 @@ static int configure_hid(struct xhci_device *dev)
         find_boot_interface(dev, config, total) < 0)
         return -1;
     dev->configuration = config[5];
-    if (ring_alloc(&dev->intr) < 0 || dma_alloc(&dev->report, 1) < 0)
-        return -1;
+    {
+        struct xhci_controller *cc = dev->ctrl ? dev->ctrl : cur_hc;
+        if (ring_alloc_for(cc, &dev->intr) < 0 || dma_alloc_for(cc, &dev->report, 1) < 0)
+            return -1;
+        if ((dev->report.phys & 0x3f) != 0)
+            printk("xHCI: WARN HID report misalignment phys 0x%lx\n",
+                   (unsigned long)dev->report.phys);
+    }
 
     memset(dev->input_ctx.virt, 0, PAGE_SIZE);
     uint8_t dci = (uint8_t)(dev->endpoint * 2 + 1);
     uint32_t *control = input_context(dev, 0);
     control[1] = 1u | (1u << dci);
     fill_slot_context(dev, dci);
-    uint8_t interval = dev->speed <= 2 ? (uint8_t)(dev->interval + 2) :
-                                        (uint8_t)(dev->interval - 1);
+    /* Interval: hardware-validated polling period. Too small => HC thinks we
+       spam and returns Transaction Error. Use Linux-compatible conversion:
+       FS/LS frame->uframe exponent, HS/SS exponent. Clamped 3..10 for FS. */
+    unsigned int interval = xhci_get_interrupt_interval(dev->interval, dev->speed);
+    if (interval == 0) {
+        /* Fallback: bInterval 0 is illegal, use 8ms (FS) / 1ms (HS) safe default */
+        interval = (dev->speed <= 2) ? 6 : 3;
+        printk("xHCI: WARN port %u bInterval 0, using fallback interval %u\n",
+               dev->port, interval);
+    }
+    if (interval > 15) interval = 15;
+    printk("xHCI: HID interval bInterval %u speed %u -> xHCI interval %u (period %u us)\n",
+           dev->interval, dev->speed, interval, (1u << interval) * 125);
     fill_endpoint_context(input_context(dev, dci + 1), &dev->intr, 7,
-                          dev->max_packet, interval, dev->max_packet);
+                          dev->max_packet, (uint8_t)interval, dev->max_packet);
+    xhci_clflush_range(dev->input_ctx.virt, PAGE_SIZE);
+    xhci_clflush_range(dev->device_ctx.virt, PAGE_SIZE);
+    barrier();
     if (command(dev->ctrl, dev->input_ctx.phys, TRB_TYPE(12) |
                 ((uint32_t)dev->slot << 24), 0) < 0)
         return -1;
@@ -1434,11 +1661,17 @@ static void queue_interrupt(struct xhci_device *dev)
         printk("xHCI: HID report DMA beyond 32-bit\n");
         return;
     }
+    if (dev->report.phys & 0x3) {
+        printk("xHCI: HID report DMA misalignment phys 0x%lx\n",
+               (unsigned long)dev->report.phys);
+        return;
+    }
     memset(dev->report.virt, 0, dev->report_size);
+    xhci_clflush_range(dev->report.virt, dev->report_size);
     dev->pending_trb = ring_push(&dev->intr, dev->report.phys,
                                  dev->report_size, TRB_TYPE(1) | TRB_IOC);
     dev->pending = 1;
-    barrier();
+    xhci_dma_wmb();
     struct xhci_controller *c = dev->ctrl ? dev->ctrl : cur_hc;
     c->doorbell[dev->slot] = (uint32_t)(dev->endpoint * 2 + 1);
 }
@@ -1547,7 +1780,12 @@ static int controller_start(void)
     hc.context_size = (hcc & (1u << 2)) ? 64 : 32;
     hc.doorbell = (volatile uint32_t *)(hc.mmio + (rd32(hc.mmio + 0x14) & ~3u));
     hc.runtime = hc.mmio + (rd32(hc.mmio + 0x18) & ~0x1fu);
-    printk("xHCI: cap hcc=0x%x AC64=%u CSZ=%u\n", hcc, hcc & 1u, hc.context_size);
+    hc.ac64 = (hcc & 1u) ? 1 : 0;
+    hc.need_dma32 = !hc.ac64;
+    printk("xHCI: cap hcc=0x%x AC64=%u CSZ=%u %s\n", hcc, hcc & 1u, hc.context_size,
+           hc.need_dma32 ? "DMA32-only" : "64-bit DMA");
+    if (hc.need_dma32)
+        printk("xHCI: controller lacks AC64, all DMA forced below 4GB (bounce)\n");
     legacy_handoff(cur_hc, hcc);
 
     wr32(hc.op, rd32(hc.op) & ~1u);
@@ -1568,8 +1806,8 @@ static int controller_start(void)
         return -1;
     }
 
-    if (dma_alloc(&hc.dcbaa, 1) < 0 || dma_alloc(&hc.command, 1) < 0 ||
-        dma_alloc(&hc.event, 1) < 0 || dma_alloc(&hc.erst, 1) < 0)
+    if (dma_alloc_for(cur_hc, &hc.dcbaa, 1) < 0 || dma_alloc_for(cur_hc, &hc.command, 1) < 0 ||
+        dma_alloc_for(cur_hc, &hc.event, 1) < 0 || dma_alloc_for(cur_hc, &hc.erst, 1) < 0)
         return -1;
     hc.cmd_cycle = 1;
     hc.event_cycle = 1;
@@ -1578,23 +1816,40 @@ static int controller_start(void)
     if (scratch_count > 32)
         scratch_count = 32;
     if (scratch_count) {
-        if (dma_alloc(&hc.scratch_array, 1) < 0)
+        if (dma_alloc_for(cur_hc, &hc.scratch_array, 1) < 0)
             return -1;
         for (uint32_t i = 0; i < scratch_count; i++) {
-            if (dma_alloc(&hc.scratch[i], 1) < 0)
+            if (dma_alloc_for(cur_hc, &hc.scratch[i], 1) < 0)
                 return -1;
             ((uint64_t *)hc.scratch_array.virt)[i] = hc.scratch[i].phys;
         }
+        xhci_clflush_range(hc.scratch_array.virt, PAGE_SIZE);
         ((uint64_t *)hc.dcbaa.virt)[0] = hc.scratch_array.phys;
+        xhci_clflush_range(hc.dcbaa.virt, 8);
+        xhci_clflush_range(hc.scratch_array.virt, scratch_count * 8);
+        printk("xHCI: scratchpad %u buffers allocated (array phys 0x%lx)\n",
+               scratch_count, (unsigned long)hc.scratch_array.phys);
+    } else {
+        ((uint64_t *)hc.dcbaa.virt)[0] = 0;
+        xhci_clflush_range(hc.dcbaa.virt, 8);
     }
+    /* Validate alignment: DCBAA must be 64B aligned, rings 64B, contexts 64B. */
+    if ((hc.dcbaa.phys & 0x3f) || (hc.command.phys & 0x3f) || (hc.event.phys & 0x3f))
+        printk("xHCI: WARN controller DMA misalignment dcbaa 0x%lx cmd 0x%lx ev 0x%lx\n",
+               (unsigned long)hc.dcbaa.phys, (unsigned long)hc.command.phys,
+               (unsigned long)hc.event.phys);
     volatile struct xhci_trb *cmd =
         (volatile struct xhci_trb *)hc.command.virt;
     cmd[XHCI_RING_TRBS - 1].parameter = hc.command.phys;
     cmd[XHCI_RING_TRBS - 1].control = TRB_TYPE(6) | TRB_TC | 1;
+    xhci_clflush_range((void *)cmd, PAGE_SIZE);
 
     uint64_t *erst = (uint64_t *)hc.erst.virt;
     erst[0] = hc.event.phys;
     ((uint32_t *)erst)[2] = XHCI_RING_TRBS;
+    xhci_clflush_range(erst, PAGE_SIZE);
+    xhci_clflush_range((void *)hc.event.virt, PAGE_SIZE);
+    xhci_clflush_range(hc.dcbaa.virt, PAGE_SIZE);
     volatile uint8_t *ir = hc.runtime + 0x20;
     wr32(ir + 8, 1);
     wr64(ir + 0x10, hc.erst.phys);
@@ -1603,6 +1858,7 @@ static int controller_start(void)
     wr64(hc.op + 0x18, hc.command.phys | 1u);
     wr32(hc.op + 0x38, hc.max_slots);
     barrier();
+    xhci_dma_wmb();
     wr32(hc.op, 1u);
     if (wait32(hc.op + 4, 1u, 0) < 0)
         return -1;

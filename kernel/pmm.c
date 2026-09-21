@@ -147,6 +147,48 @@ void *pmm_alloc_frames(uint64_t count)
     return 0;
 }
 
+void *pmm_alloc_frames_below(uint64_t count, uint64_t max_phys)
+{
+    if (count == 0 || max_phys == 0)
+        return 0;
+    uint64_t max_frame = max_phys >> PAGE_SHIFT;
+    if (max_frame == 0)
+        return 0;
+    if (max_frame > total_frames)
+        max_frame = total_frames;
+    if (count > max_frame)
+        return 0;
+    for (uint64_t start = 0; start + count <= max_frame; )
+    {
+        while (start < max_frame && bm_test(start))
+            start++;
+        if (start + count > max_frame)
+            break;
+        uint64_t free_run = 0;
+        for (uint64_t j = start; j < max_frame && free_run < count; j++)
+        {
+            if (!bm_test(j))
+                free_run++;
+            else
+                break;
+        }
+        if (free_run >= count)
+        {
+            for (uint64_t j = 0; j < count; j++)
+                bm_set(start + j);
+            free_frames -= count;
+            return (void *)(start << PAGE_SHIFT);
+        }
+        start += free_run + 1;
+    }
+    return 0;
+}
+
+void *pmm_alloc_frames_dma32(uint64_t count)
+{
+    return pmm_alloc_frames_below(count, 0x100000000ULL);
+}
+
 void pmm_free_frame(void *addr)
 {
     uint64_t frame = (uint64_t)addr >> PAGE_SHIFT;
