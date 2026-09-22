@@ -5,7 +5,9 @@
 #include "pmm.h"
 #include "apic.h"
 #include "clock.h"
+#include "cmos.h"
 #include "rtc_efi.h"
+#include "rtc_sync.h"
 #include "tss.h"
 #include "ioapic.h"
 #include "keyboard.h"
@@ -269,6 +271,10 @@ void kmain(struct axboot_info *info)
         }
     }
     clock_init(boot_unix, tz_offset);
+
+    /* Start CMOS RTC drift correction service: checks every 5 s, corrects
+       if wall time is off by >= 2 s compared to the hardware RTC. */
+    rtc_sync_init();
 
     klog_flush();
 

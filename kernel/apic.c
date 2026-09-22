@@ -24,11 +24,13 @@
 #define PIT_CMD       0x43
 #define PIT_CTL       0x61
 
-/* Calibration: count APIC ticks over a 10 ms PIT gate (PIT at 1193182 Hz,
-   10 ms = 11931 counts). */
-#define PIT_CALIBRATE_MS    10
+/* Calibration: count APIC ticks over a 30 ms PIT gate (PIT at 1193182 Hz,
+    30 ms = 35795 counts). Longer window reduces APIC bus-tick measurement
+    error that otherwise manifests as wall-clock drift (APIC seconds counting
+    not so precise). */
+#define PIT_CALIBRATE_MS    30
 #define PIT_HZ              1193182UL
-#define PIT_CALIB_COUNT     ((PIT_HZ * PIT_CALIBRATE_MS) / 1000)  /* ~11931 */
+#define PIT_CALIB_COUNT     ((PIT_HZ * PIT_CALIBRATE_MS) / 1000)  /* ~35795 */
 
 static volatile uint32_t *apic_base;
 static volatile uint64_t timer_ticks;
@@ -80,26 +82,49 @@ void apic_timer_tick(void)
     timer_ticks++;
 }
 
-/* Set ns_per_tick_scaled from the pre-IRQ calibrated ticks_per_ms.
-   Each timer ISR fires once per apic_timer_start() reload period.
-   apic_timer_start(0) uses ticks_per_ms raw APIC counts = ~1 ms.
-   So each timer_ticks increment = 1 ms = 1,000,000 ns.
-   ns_per_tick_scaled = 1,000,000 * 2^20 (fixed-point, shifted 20).
-   Must be called after apic_timer_start(0) and hal_cpu_irq_enable(). */
+/* Measure the real tick->ns conversion factor against the PIT once IRQs are
+   live. We cannot assume each timer ISR firing is exactly 1 ms of real time:
+   the APIC timer's actual period depends on the bus clock / divider and can
+   be several percent off the nominal 1 ms (observed ~10% slow here), and the
+   pre-IRQ raw_ticks_per_ms estimate is only used to pick the reload count.
+   So count ISR firings over a PIT reference gate and derive the true ratio.
+   Must be called after apic_timer_start() and hal_cpu_irq_enable(). */
 void apic_calibrate_post_irq(void)
 {
-    /* Each ISR firing = one apic_timer_start period.
-       apic_timer_start(0) loaded ticks_per_ms raw APIC counts.
-       From pre-IRQ calibration, ticks_per_ms raw counts ≈ 1 ms.
-       So 1 timer_tick = 1 ms = 1,000,000 ns. */
-    ns_per_tick_scaled = 1000000ULL << 20;
+    /* 8 back-to-back PIT channel-2 windows, 50 ms each: ~400 ms baseline.
+       CAL_WIN_MS must keep the 16-bit PIT count <= 65535 (~54.9 ms max). */
+    enum { CAL_WINDOWS = 8, CAL_WIN_MS = 50 };
+    const uint16_t cal_count = (uint16_t)((PIT_HZ * CAL_WIN_MS) / 1000);
 
-    printk("APIC: 1 tick = 1 ms, ns_per_tick_scaled=%lu (ticks_per_ms=%lu raw)\n",
-           (unsigned long)ns_per_tick_scaled,
-           (unsigned long)ticks_per_ms);
+    uint64_t t0 = timer_ticks;
 
-    /* Overwrite ticks_per_ms to mean ISR-firings-per-ms = 1. */
+    for (int i = 0; i < CAL_WINDOWS; i++) {
+        /* Mode 0 (one-shot), lsb+msb: writing the count starts the gate.
+           Reloading after a window restarts it (OUT drops then retriggers). */
+        outb(PIT_CMD, 0xB0);
+        outb(PIT_CH2_DATA, (uint8_t)(cal_count & 0xFF));
+        outb(PIT_CH2_DATA, (uint8_t)(cal_count >> 8));
+        while (!(inb(PIT_CTL) & 0x20))
+            hal_cpu_pause();
+    }
+
+    uint64_t t1 = timer_ticks;
+    uint64_t ticks = t1 - t0;
+    if (ticks == 0)
+        ticks = 1;
+
+    uint64_t real_ns = (uint64_t)CAL_WINDOWS * CAL_WIN_MS * 1000000ULL;
+    ns_per_tick_scaled = (real_ns << 20) / ticks;
+
+    /* ticks_per_ms no longer drives the reload (the timer is already running
+       at that count); keep it as the ISR-firings-per-ms accounting rate. */
     ticks_per_ms = 1;
+
+    printk("APIC: post-irq calibrate: %lu ISR ticks in %lu ms => %lu ns/tick (scaled %lu)\n",
+           (unsigned long)ticks,
+           (unsigned long)(CAL_WINDOWS * CAL_WIN_MS),
+           (unsigned long)(ns_per_tick_scaled >> 20),
+           (unsigned long)ns_per_tick_scaled);
 }
 
 /* Calibrate the APIC timer against PIT channel 2 (early boot, pre-IRQ).

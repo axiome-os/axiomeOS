@@ -22,6 +22,26 @@ uint64_t clock_wall_sec(void);
 /* Wall-clock with sub-second precision. */
 void clock_wall_ns(uint64_t *sec_out, uint64_t *nsec_out);
 
+/* Timezone offset (seconds east of UTC) as passed to clock_init(). */
+int64_t clock_get_tz_offset(void);
+
+/* UTC wall-clock (without timezone offset). */
+uint64_t clock_wall_utc_sec(void);
+
+/* Directly set the wall-clock to new_sec (local time). */
+void clock_set_wall_sec(uint64_t new_sec);
+
+/* Set wall-clock from an RTC UTC value (adds tz offset internally). */
+void clock_set_utc_sec(uint64_t new_utc_sec);
+
+/* Resync helpers: compare current time with rtc_utc and correct if
+   abs drift >= threshold_sec. Returns 1 if corrected, 0 if within
+   threshold, -1 if rtc invalid. */
+int clock_resync_from_rtc(uint64_t rtc_utc_sec, uint64_t threshold_sec);
+
+/* Drift in seconds between wall UTC and rtc UTC (signed). */
+int64_t clock_drift_from_rtc(uint64_t rtc_utc_sec);
+
 #ifdef __cplusplus
 }
 #endif
