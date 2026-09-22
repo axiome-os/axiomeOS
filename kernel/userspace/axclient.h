@@ -144,6 +144,21 @@ static void axclient_commit(struct axclient *cx)
     cx->hdr->seq++;
 }
 
+/* Caps from compositor (GUI asks guixd which queries gfx). */
+static inline uint64_t axclient_caps(struct axclient *cx)
+{
+    return cx && cx->hdr ? cx->hdr->gfx_caps : 0;
+}
+static inline int axclient_has_cap(struct axclient *cx, uint64_t cap)
+{
+    return cx && cx->hdr && (cx->hdr->gfx_caps & cap);
+}
+static inline const char *axclient_detail_mode(struct axclient *cx)
+{
+    if (!cx || !cx->hdr) return "simplified";
+    return cx->hdr->gfx_detail ? "detailed" : "simplified";
+}
+
 /* Compositor asked for exit (it also closes evfd, so recv gets EOF). */
 static int axclient_closed(struct axclient *cx)
 {

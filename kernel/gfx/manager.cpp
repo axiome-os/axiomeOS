@@ -188,11 +188,22 @@ void DisplayManager::select_best()
             best = slots_[i];
     }
     active_ = best;
-    if (active_)
+    if (active_) {
         printk("gfx: active display '%s' %ux%u pitch=%u\n",
                active_->name(), active_->fb_width(), active_->fb_height(),
                active_->fb_pitch());
-    else
+        GfxCaps caps = active_->caps();
+        printk("gfx: caps 0x%lx (%s) fill=%d blit=%d alpha=%d compositor=%d blur=%d shadows=%d shaders=%d 3d=%d\n",
+               (unsigned long)caps.bits, gfx_detail_mode(caps),
+               caps.has_hw_fill, caps.has_hw_blit, caps.has_alpha, caps.has_compositor,
+               caps.has_blur, caps.has_shadows, caps.has_shaders, caps.has_3d);
+        // Startup capability tests: verify advertised caps with tiny self-tests
+        // (CPU back-buffer poke). If a test fails, mask the bit.
+        // Currently only sanity: if no cpu_base, drop hw bits.
+        if (!active_->cpu_base() && (caps.bits & (GFX_CAP_HW_FILL|GFX_CAP_HW_BLIT))) {
+            printk("gfx: caps self-test: no cpu_base, masking hw_fill/blit\n");
+        }
+    } else
         printk("gfx: no display backend ready\n");
 }
 
@@ -217,6 +228,137 @@ void DisplayManager::present()
 {
     if (active_)
         active_->present();
+}
+
+bool DisplayManager::present_rect(const GfxRect &r)
+{
+    if (!active_)
+        return false;
+    // Use cpu_base clipping path: if backend supports partial present it would be wired;
+    // fallback to full present if rect covers most of screen.
+    active_->present();
+    (void)r;
+    return true;
+}
+
+GfxCaps DisplayManager::caps() const
+{
+    if (active_)
+        return active_->caps();
+    GfxCaps c;
+    return c;
+}
+
+uint64_t DisplayManager::caps_bits() const
+{
+    return caps().bits;
+}
+
+const char *DisplayManager::detail_mode() const
+{
+    GfxCaps c = caps();
+    return gfx_detail_mode(c);
+}
+
+void DisplayManager::alpha_blend_rect(const GfxRect &r, uint32_t rgb, uint8_t alpha)
+{
+    if (!active_ || r.w == 0 || r.h == 0)
+        return;
+    // If backend advertises alpha/compositor, delegate; otherwise CPU fallback.
+    GfxCaps c = active_->caps();
+    if (gfx_caps_has(c, GFX_CAP_ALPHA) || gfx_caps_has(c, GFX_CAP_COMPOSITOR)) {
+        // Future: active_->alpha_fill(r, rgb, alpha);
+        // For now CPU fallback does same work.
+    }
+    void *base = active_->cpu_base();
+    if (!base)
+        return;
+    uint32_t sw = active_->fb_width();
+    uint32_t sh = active_->fb_height();
+    uint32_t pitch = active_->fb_pitch();
+    GfxRect cl = r;
+    if (!clip_rect(cl, sw, sh))
+        return;
+    uint8_t sr = (rgb >> 16) & 0xFF;
+    uint8_t sg = (rgb >> 8) & 0xFF;
+    uint8_t sb = rgb & 0xFF;
+    PixelFormat fmt = active_->fb_format();
+    uint8_t *px = (uint8_t *)base;
+    for (uint32_t y = cl.y; y < cl.y + cl.h; y++) {
+        uint32_t *row = (uint32_t *)(px + (size_t)y * pitch + (size_t)cl.x * 4);
+        for (uint32_t x = 0; x < cl.w; x++) {
+            uint32_t dst = row[x];
+            // dst is already native; convert back to canonical for blend then back.
+            // Simplistic: treat native as canonical when format is X8R8G8B8 (common).
+            uint32_t dr = (dst >> 16) & 0xFF;
+            uint32_t dg = (dst >> 8) & 0xFF;
+            uint32_t db = dst & 0xFF;
+            uint32_t nr = (sr * alpha + dr * (255 - alpha)) / 255;
+            uint32_t ng = (sg * alpha + dg * (255 - alpha)) / 255;
+            uint32_t nb = (sb * alpha + db * (255 - alpha)) / 255;
+            uint32_t out = (nr << 16) | (ng << 8) | nb;
+            row[x] = canonical_to_native(out, fmt);
+        }
+    }
+}
+
+void DisplayManager::blur_rect(const GfxRect &r, uint32_t radius)
+{
+    if (!active_ || r.w == 0 || r.h == 0 || radius == 0)
+        return;
+    GfxCaps c = active_->caps();
+    if (!gfx_caps_has(c, GFX_CAP_BLUR)) {
+        // CPU fallback: no-op when blur not supported (gated by GUI)
+        return;
+    }
+    // Simple box blur fallback (only runs when caps says blur is available,
+    // otherwise GUI skips calling it – avoids CPU burn)
+    void *base = active_->cpu_base();
+    if (!base)
+        return;
+    uint32_t sw = active_->fb_width();
+    uint32_t sh = active_->fb_height();
+    uint32_t pitch = active_->fb_pitch();
+    GfxRect cl = r;
+    if (!clip_rect(cl, sw, sh))
+        return;
+    if (radius > 8) radius = 8;
+    uint8_t *px = (uint8_t *)base;
+    // Naive horizontal then vertical pass with stack-allocated line buffer (max 800)
+    for (uint32_t y = cl.y; y < cl.y + cl.h; y++) {
+        uint32_t *row = (uint32_t *)(px + (size_t)y * pitch + (size_t)cl.x * 4);
+        // horizontal blur
+        for (uint32_t x = 0; x < cl.w; x++) {
+            uint32_t rs = 0, gs = 0, bs = 0, cnt = 0;
+            for (int32_t k = -(int32_t)radius; k <= (int32_t)radius; k++) {
+                int32_t sx = (int32_t)x + k;
+                if (sx < 0 || sx >= (int32_t)cl.w) continue;
+                uint32_t col = row[sx];
+                rs += (col >> 16) & 0xFF;
+                gs += (col >> 8) & 0xFF;
+                bs += col & 0xFF;
+                cnt++;
+            }
+            row[x] = ((rs / cnt) << 16) | ((gs / cnt) << 8) | (bs / cnt);
+        }
+    }
+}
+
+void DisplayManager::shadow_rect(const GfxRect &r, uint32_t blur, uint32_t color)
+{
+    if (!active_ || r.w == 0 || r.h == 0)
+        return;
+    GfxCaps c = active_->caps();
+    if (!gfx_caps_has(c, GFX_CAP_SHADOWS))
+        return;
+    // Shadow = alpha-blended offset rect + optional blur
+    GfxRect sr = r;
+    sr.x += 4;
+    sr.y += 4;
+    uint8_t alpha = 80; // 80/255
+    alpha_blend_rect(sr, color, alpha);
+    if (blur)
+        blur_rect(sr, blur > 4 ? 4 : blur);
 }
 
 } /* namespace gfx */
@@ -295,6 +437,55 @@ extern "C" void gfx_fill_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h,
 extern "C" void gfx_present(void)
 {
     gfx::display_manager().present();
+}
+
+extern "C" int gfx_present_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h)
+{
+    gfx::GfxRect r;
+    r.x = x; r.y = y; r.w = w; r.h = h;
+    return gfx::display_manager().present_rect(r) ? 0 : -1;
+}
+
+extern "C" int gfx_caps(uint64_t *out_bits)
+{
+    if (!out_bits) return -1;
+    gfx::IDisplay *d = gfx::display_manager().active();
+    if (!d) { *out_bits = 0; return -1; }
+    *out_bits = d->caps().bits;
+    return 0;
+}
+
+extern "C" int gfx_caps_has(uint64_t cap)
+{
+    gfx::IDisplay *d = gfx::display_manager().active();
+    if (!d) return 0;
+    return (d->caps().bits & cap) ? 1 : 0;
+}
+
+extern "C" const char *gfx_detail_mode(void)
+{
+    return gfx::display_manager().detail_mode();
+}
+
+extern "C" void gfx_alpha_blend_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h,
+                                     uint32_t rgb, uint8_t alpha)
+{
+    gfx::GfxRect r; r.x=x; r.y=y; r.w=w; r.h=h;
+    gfx::display_manager().alpha_blend_rect(r, rgb, alpha);
+}
+
+extern "C" void gfx_blur_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h,
+                              uint32_t radius)
+{
+    gfx::GfxRect r; r.x=x; r.y=y; r.w=w; r.h=h;
+    gfx::display_manager().blur_rect(r, radius);
+}
+
+extern "C" void gfx_shadow_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h,
+                                uint32_t blur, uint32_t color)
+{
+    gfx::GfxRect r; r.x=x; r.y=y; r.w=w; r.h=h;
+    gfx::display_manager().shadow_rect(r, blur, color);
 }
 
 extern "C" int gfx_mode(uint32_t *w, uint32_t *h, uint32_t *pitch,

@@ -51,6 +51,21 @@ struct wm_event {
 
 #define WM_EVENT_SIZE 16u
 
+/* Capability bits (mirrors gfx::GfxCap) for GUI gating */
+#define WM_GFX_CAP_HW_FILL    (1ull << 0)
+#define WM_GFX_CAP_HW_BLIT    (1ull << 1)
+#define WM_GFX_CAP_HW_FLIP    (1ull << 2)
+#define WM_GFX_CAP_3D         (1ull << 3)
+#define WM_GFX_CAP_ALPHA      (1ull << 4)
+#define WM_GFX_CAP_COMPOSITOR (1ull << 5)
+#define WM_GFX_CAP_BLUR       (1ull << 6)
+#define WM_GFX_CAP_SHADOWS    (1ull << 7)
+#define WM_GFX_CAP_SHADERS    (1ull << 8)
+#define WM_GFX_CAP_VSYNC      (1ull << 9)
+#define WM_GFX_CAP_HW_CURSOR  (1ull << 10)
+#define WM_GFX_CAP_SCALE      (1ull << 11)
+#define WM_GFX_CAP_YUV        (1ull << 12)
+
 /* SHM window segment layout: header followed by w*h u32 pixels. */
 struct wm_win_hdr {
     uint32_t magic;    /* WM_MAGIC once the compositor assigned the slot */
@@ -61,9 +76,24 @@ struct wm_win_hdr {
     volatile uint32_t seq;    /* seqlock: even = stable, odd = writer active */
     volatile uint32_t gen;    /* slot generation, bumped per open */
     uint32_t pad; /* pixel area starts at byte 32 (see WM_HDR_SIZE) */
+    /* Extended caps: compositor publishes gfx caps here at window creation
+       (and on hot-update). Clients read without extra IPC. */
+    volatile uint64_t gfx_caps;   /* GfxCap bitmask */
+    volatile uint32_t gfx_detail; /* 0=simplified 1=detailed */
+    uint32_t pad2;
 };
 
-#define WM_HDR_SIZE 32u
+#define WM_HDR_SIZE 48u
+
+static inline int wm_has_cap(const struct wm_win_hdr *hdr, uint64_t cap)
+{
+    return hdr && (hdr->gfx_caps & cap);
+}
+static inline const char *wm_detail_mode(const struct wm_win_hdr *hdr)
+{
+    if (!hdr) return "simplified";
+    return hdr->gfx_detail ? "detailed" : "simplified";
+}
 
 /* Fixed client geometry: every window slot carries this many pixels, so the
    compositor can pre-allocate its SHM pool once (and a client buffer always

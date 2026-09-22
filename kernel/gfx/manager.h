@@ -35,6 +35,13 @@ public:
     void clear(uint32_t rgb);
     void fill_rect(const GfxRect &r, uint32_t rgb);
     void present();
+    bool present_rect(const GfxRect &r);
+    GfxCaps caps() const;
+    uint64_t caps_bits() const;
+    const char *detail_mode() const;
+    void alpha_blend_rect(const GfxRect &r, uint32_t rgb, uint8_t alpha);
+    void blur_rect(const GfxRect &r, uint32_t radius);
+    void shadow_rect(const GfxRect &r, uint32_t blur, uint32_t color);
 
 private:
     static uint32_t driver_flag_for_name(const char *name);
@@ -63,8 +70,20 @@ void gfx_clear(uint32_t rgb);
 void gfx_fill_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h,
                    uint32_t rgb);
 void gfx_present(void);
+int gfx_present_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h);
 int gfx_mode(uint32_t *w, uint32_t *h, uint32_t *pitch, uint32_t *bpp);
 void *gfx_cpu_base(void);
+/* Caps query (capability flags). Returns 0 on success. */
+int gfx_caps(uint64_t *out_bits);
+int gfx_caps_has(uint64_t cap);
+const char *gfx_detail_mode(void);
+/* Extended 2D / effects (CPU fallback if hw missing) */
+void gfx_alpha_blend_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h,
+                          uint32_t rgb, uint8_t alpha);
+void gfx_blur_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h,
+                   uint32_t radius);
+void gfx_shadow_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h,
+                     uint32_t blur, uint32_t color);
 
 /* Property API – temporary in-code disable for drivers. Safe to call
     before gfx_init() (preferred) or at runtime before next select_best(). */

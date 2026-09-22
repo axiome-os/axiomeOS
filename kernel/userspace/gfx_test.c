@@ -17,6 +17,13 @@ enum {
     AXDRI_DUMB_MAP = 0x03,
     AXDRI_DUMB_DESTROY = 0x04,
     AXDRI_PRESENT = 0x05,
+    AXDRI_GET_CAPS = 0x06,
+};
+
+struct axdri_caps {
+    uint64_t caps;
+    uint32_t detail;
+    uint32_t pad;
 };
 
 struct axdri_mode {
@@ -60,6 +67,25 @@ int main(int argc, char **argv)
     }
     printf("dri: mode %ux%u pitch=%u bpp=%u\n", m.width, m.height, m.pitch,
            m.bpp);
+    /* Query caps */
+    {
+        struct axdri_cmd gc;
+        gc.magic = AXDRI_MAGIC;
+        gc.op = AXDRI_GET_CAPS;
+        gc.args[0]=0;gc.args[1]=0;gc.args[2]=0;gc.args[3]=0;gc.args[4]=0;gc.args[5]=0;
+        if (write(fd, &gc, sizeof(gc)) == (long)sizeof(gc)) {
+            uint64_t caps = ((uint64_t)gc.args[1]<<32)|gc.args[0];
+            const char *mode2 = gc.args[2] ? "detailed" : "simplified";
+            printf("dri: caps 0x%lx mode=%s blur=%d alpha=%d compositor=%d shadows=%d shaders=%d 3d=%d\n",
+                   (unsigned long)caps, mode2,
+                   (caps>>6)&1, (caps>>4)&1, (caps>>5)&1, (caps>>7)&1, (caps>>8)&1, (caps>>3)&1);
+            if (!(caps & (1ull<<6))) printf("dri: blur disabled on CPU – use simplified path\n");
+        } else {
+            struct axdri_caps caps2;
+            if (read(fd, &caps2, sizeof(caps2)) == (long)sizeof(caps2))
+                printf("dri: caps 0x%lx detail=%u via read\n", (unsigned long)caps2.caps, caps2.detail);
+        }
+    }
 
     struct axdri_cmd c;
     c.magic = AXDRI_MAGIC;

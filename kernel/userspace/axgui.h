@@ -38,7 +38,31 @@ enum {
     AXGUI_DUMB_MAP = 0x03,
     AXGUI_DUMB_DESTROY = 0x04,
     AXGUI_PRESENT = 0x05,
+    AXGUI_GET_CAPS = 0x06,
 };
+
+struct axgui_caps {
+    uint64_t caps;
+    uint32_t detail; /* 0=simplified 1=detailed */
+    uint32_t pad;
+};
+
+/* Capability bits (mirrors kernel/gfx/gfx_types.h GfxCap) */
+#define AXGUI_CAP_HW_FILL    (1ull << 0)
+#define AXGUI_CAP_HW_BLIT    (1ull << 1)
+#define AXGUI_CAP_HW_FLIP    (1ull << 2)
+#define AXGUI_CAP_3D         (1ull << 3)
+#define AXGUI_CAP_ALPHA      (1ull << 4)
+#define AXGUI_CAP_COMPOSITOR (1ull << 5)
+#define AXGUI_CAP_BLUR       (1ull << 6)
+#define AXGUI_CAP_SHADOWS    (1ull << 7)
+#define AXGUI_CAP_SHADERS    (1ull << 8)
+#define AXGUI_CAP_VSYNC      (1ull << 9)
+#define AXGUI_CAP_HW_CURSOR  (1ull << 10)
+#define AXGUI_CAP_SCALE      (1ull << 11)
+#define AXGUI_CAP_YUV        (1ull << 12)
+#define AXGUI_CAP_GRADIENT   (1ull << 13)
+#define AXGUI_CAP_ROUNDED    (1ull << 14)
 
 struct axgui_mode {
     uint32_t width;
@@ -175,6 +199,37 @@ static int axgui_present_rect(struct axgui_fb *fb, int x, int y, int w, int h)
     return (write(fb->fd, &p, sizeof(p)) == (long)sizeof(p)) ? 0 : -1;
 }
 
+static int axgui_get_caps(struct axgui_fb *fb, struct axgui_caps *out)
+{
+    struct axgui_cmd c;
+    if (!fb || fb->fd < 0 || !out)
+        return -1;
+    /* Try read path first (freestanding axdri_caps) */
+    if (read(fb->fd, out, sizeof(*out)) == (long)sizeof(*out) && out->caps != 0)
+        return 0;
+    /* Fallback to ioctl-over-write */
+    c.magic = AXGUI_DRI_MAGIC;
+    c.op = AXGUI_GET_CAPS;
+    c.args[0] = 0; c.args[1] = 0; c.args[2] = 0; c.args[3] = 0; c.args[4] = 0; c.args[5] = 0;
+    if (write(fb->fd, &c, sizeof(c)) != (long)sizeof(c))
+        return -1;
+    out->caps = ((uint64_t)c.args[1] << 32) | c.args[0];
+    out->detail = c.args[2];
+    out->pad = 0;
+    return 0;
+}
+
+static inline int axgui_caps_has(struct axgui_caps *caps, uint64_t bit)
+{
+    return caps && (caps->caps & bit);
+}
+
+static inline const char *axgui_detail_mode(struct axgui_caps *caps)
+{
+    if (!caps) return "simplified";
+    return caps->detail ? "detailed" : "simplified";
+}
+
 static void axgui_close(struct axgui_fb *fb)
 {
     struct axgui_cmd k;
@@ -233,6 +288,70 @@ static void axgui_msleep(long ms)
     nanosleep(&ts, 0);
 }
 
+static inline uint64_t axgui_now_us(void)
+{
+    struct timeval tv;
+    if (gettimeofday(&tv, 0) != 0)
+        return 0;
+    return (uint64_t)tv.tv_sec * 1000000ULL + (uint64_t)tv.tv_usec;
+}
+
+static inline void axgui_sleep_us(long us)
+{
+    struct timespec ts;
+    if (us <= 0)
+    {
+        sys_yield();
+        return;
+    }
+    if (us < 2000)
+    {
+        sys_yield();
+        return;
+    }
+    ts.tv_sec = us / 1000000L;
+    ts.tv_nsec = (us % 1000000L) * 1000L;
+    nanosleep(&ts, 0);
+}
+
+/* ---- auto refresh --- target intervals (microseconds) ---- */
+#define AXGUI_TARGET_144_US  6944
+#define AXGUI_TARGET_60_US  16666
+#define AXGUI_TARGET_30_US  33333
+#define AXGUI_TARGET_20_US  50000
+#define AXGUI_IDLE_US      33333
+
+/* Pick an ideal vsync interval from caps: hardware vsync/flip can push
+   higher rates, otherwise fall back to 60. */
+static inline uint64_t axgui_ideal_interval_us(struct axgui_caps *caps)
+{
+    if (caps && (caps->caps & (AXGUI_CAP_VSYNC | AXGUI_CAP_HW_FLIP)))
+        return AXGUI_TARGET_60_US;
+    return AXGUI_TARGET_60_US;
+}
+
+/* Adaptive target: active (state change / mouse) wants 60 Hz, idle can drop
+   to 30 Hz to save CPU while keeping input latency reasonable. The caller
+   feeds the recent average frame time so we auto-downgrade when the machine
+   cannot sustain the ideal rate (e.g. software compositor on large mode). */
+static inline uint64_t axgui_auto_target_us(struct axgui_caps *caps,
+                                            int active,
+                                            uint64_t avg_us)
+{
+    uint64_t ideal = axgui_ideal_interval_us(caps);
+    uint64_t target = active ? ideal : AXGUI_IDLE_US;
+    /* If we are consistently over budget, step down to the next rate so we
+       stop spinning with zero sleep and stuttering. Hysteresis keeps it calm. */
+    if (active && avg_us > ideal + 4000)
+    {
+        if (avg_us > 28000)
+            target = AXGUI_TARGET_20_US;
+        else
+            target = AXGUI_TARGET_30_US;
+    }
+    return target;
+}
+
 /* ---- 2D primitives on a 32-bit dumb buffer (canonical 0x00RRGGBB) ---- */
 static void axgui_px(struct axgui_fb *fb, int x, int y, uint32_t rgb)
 {
@@ -276,6 +395,67 @@ static void axgui_rect(struct axgui_fb *fb, int x, int y, int w, int h,
         axgui_px(fb, x, y + i, rgb);
         axgui_px(fb, x + w - 1, y + i, rgb);
     }
+}
+
+/* Extended 2D / effects (CPU fallback; hw path goes via DRI) */
+static void axgui_alpha_blend(struct axgui_fb *fb, int x, int y, int w, int h,
+                              uint32_t rgb, uint8_t alpha)
+{
+    int x0, y0, x1, y1, yy, xx;
+    if (!fb || !fb->px || w <= 0 || h <= 0) return;
+    if (alpha == 0) return;
+    if (alpha == 255) { axgui_fill(fb, x, y, w, h, rgb); return; }
+    x0 = x < 0 ? 0 : x; y0 = y < 0 ? 0 : y;
+    x1 = x + w > (int)fb->w ? (int)fb->w : x + w;
+    y1 = y + h > (int)fb->h ? (int)fb->h : y + h;
+    uint8_t sr = (rgb >> 16) & 0xFF, sg = (rgb >> 8) & 0xFF, sb = rgb & 0xFF;
+    size_t stride = fb->pitch / 4;
+    for (yy = y0; yy < y1; yy++)
+        for (xx = x0; xx < x1; xx++) {
+            uint32_t dst = fb->px[(size_t)yy * stride + (size_t)xx];
+            uint32_t dr = (dst >> 16) & 0xFF, dg = (dst >> 8) & 0xFF, db = dst & 0xFF;
+            uint32_t nr = (sr * alpha + dr * (255 - alpha)) / 255;
+            uint32_t ng = (sg * alpha + dg * (255 - alpha)) / 255;
+            uint32_t nb = (sb * alpha + db * (255 - alpha)) / 255;
+            fb->px[(size_t)yy * stride + (size_t)xx] = (nr << 16) | (ng << 8) | nb;
+        }
+}
+
+static void axgui_shadow(struct axgui_fb *fb, int x, int y, int w, int h,
+                         uint32_t color, uint8_t alpha)
+{
+    /* offset shadow; caller gates on caps */
+    axgui_alpha_blend(fb, x + 4, y + 4, w, h, color, alpha);
+}
+
+static void axgui_blur_rect(struct axgui_fb *fb, int x, int y, int w, int h,
+                            int radius)
+{
+    int x0, y0, x1, y1;
+    if (!fb || !fb->px || w <= 0 || h <= 0 || radius <= 0) return;
+    if (radius > 6) radius = 6;
+    x0 = x < 0 ? 0 : x; y0 = y < 0 ? 0 : y;
+    x1 = x + w > (int)fb->w ? (int)fb->w : x + w;
+    y1 = y + h > (int)fb->h ? (int)fb->h : y + h;
+    if (x1 <= x0 || y1 <= y0) return;
+    /* Simple box blur (horizontal) – intentionally lightweight */
+    for (int yy = y0; yy < y1; yy++) {
+        for (int xx = x0; xx < x1; xx++) {
+            uint32_t rs=0, gs=0, bs=0, cnt=0;
+            for (int k=-radius; k<=radius; k++) {
+                int sx = xx + k;
+                if (sx < x0 || sx >= x1) continue;
+                uint32_t c = fb->px[(size_t)yy * (fb->pitch/4) + (size_t)sx];
+                rs += (c>>16)&0xFF; gs += (c>>8)&0xFF; bs += c & 0xFF; cnt++;
+            }
+            if (cnt) fb->px[(size_t)yy*(fb->pitch/4)+(size_t)xx] = (rs/cnt<<16)|(gs/cnt<<8)|(bs/cnt);
+        }
+    }
+}
+
+static inline int axgui_has_cap(struct axgui_caps *c, uint64_t cap)
+{
+    return c && (c->caps & cap);
 }
 
 static void axgui_glyph(struct axgui_fb *fb, char c, int x, int y,

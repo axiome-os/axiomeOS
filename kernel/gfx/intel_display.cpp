@@ -57,10 +57,8 @@ bool IntelDisplay::init(const GfxMode & /*mode*/)
 GfxCaps IntelDisplay::caps() const
 {
     GfxCaps c;
-    c.has_hw_fill = 0;
-    c.has_hw_blit = 0;
-    c.has_hw_flip = 0;
-    c.has_3d = 0; /* set when command submission lands */
+    // Stub: no caps until GTT + engine init lands; then set fill/blit/alpha/compositor
+    gfx_caps_sync_bits(c);
     return c;
 }
 

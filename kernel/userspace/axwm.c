@@ -583,8 +583,12 @@ int main(int argc, char **argv)
     scan_apps();
     open_terminal(0, &fb);
 
+    /* Auto refresh: EMA of frame time + adaptive target (mirrors guixd). */
+    uint64_t avg_us = AXGUI_TARGET_60_US;
+
     for (;;)
     {
+        uint64_t frame_start_us = axgui_now_us();
         int n = axgui_poll(input_fd, ev, 64);
         int state_changed = 0;
         int mouse_moved = 0;
@@ -754,7 +758,30 @@ int main(int argc, char **argv)
         {
             redraw_cursor_only(&fb);
         }
-        axgui_msleep(16);
+        /* ---- auto refresh --- elastic pacing to hit 60 Hz when possible,
+           auto-downgrading when the software render overruns (was fixed 16 ms,
+           so render+16 always pushed real FPS to ~20). */
+        {
+            uint64_t now_us = axgui_now_us();
+            uint64_t elapsed_us = (now_us > frame_start_us) ? now_us - frame_start_us : 0;
+            uint64_t target_us;
+            long remain_us;
+            int active = state_changed || mouse_moved;
+            avg_us = (avg_us * 7 + elapsed_us) / 8;
+            if (avg_us < 1000)
+                avg_us = elapsed_us;
+            /* axwm has no caps query; pass 0 → defaults to 60/idle split. */
+            target_us = axgui_auto_target_us(0, active, avg_us);
+            if (elapsed_us >= target_us)
+                sys_yield();
+            else
+            {
+                remain_us = (long)(target_us - elapsed_us);
+                if (!active && remain_us > 50000)
+                    remain_us = 50000;
+                axgui_sleep_us(remain_us);
+            }
+        }
     }
 
     for (i = 0; i < (int)WM_MAX_WIN; i++)

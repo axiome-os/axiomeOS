@@ -228,6 +228,30 @@ struct axmui_app {
     int running;
 };
 
+/* caps helpers (GUI asks hdr for gfx caps) */
+static inline uint64_t axmui_window_caps(axmui_window_t *win)
+{
+    if (!win || !win->cx.hdr) return 0;
+    return win->cx.hdr->gfx_caps;
+}
+static inline int axmui_has_cap(axmui_window_t *win, uint64_t cap)
+{
+    return (axmui_window_caps(win) & cap) != 0;
+}
+static inline const char *axmui_detail_mode(axmui_window_t *win)
+{
+    if (!win || !win->cx.hdr) return "simplified";
+    return win->cx.hdr->gfx_detail ? "detailed" : "simplified";
+}
+static inline int axmui_should_blur(axmui_window_t *win)
+{
+    return axmui_has_cap(win, WM_GFX_CAP_BLUR);
+}
+static inline int axmui_should_shadow(axmui_window_t *win)
+{
+    return axmui_has_cap(win, WM_GFX_CAP_SHADOWS);
+}
+
 /* ================================================================== */
 /*  Helpers (static)                                                   */
 

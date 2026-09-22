@@ -36,6 +36,13 @@ public:
                       uint32_t src_pitch_px) = 0;
     /* Push staged pixels to the scanout surface (GOP: WC flush + sfence). */
     virtual void present() = 0;
+    /* Optional extended primitives: default CPU fallback (manager implements). */
+    virtual bool present_rect(const GfxRect &r) { (void)r; present(); return true; }
+    virtual void alpha_blend(const GfxRect &r, uint32_t rgb, uint8_t alpha) { (void)r; (void)rgb; (void)alpha; }
+    virtual void blur(const GfxRect &r, uint32_t radius) { (void)r; (void)radius; }
+    virtual void shadow(const GfxRect &r, uint32_t blur, uint32_t color) { (void)r; (void)blur; (void)color; }
+    /* Capability self-test: return false to mask that cap bit. */
+    virtual bool test_cap(GfxCap cap) const { (void)cap; return true; }
 
     /* Linear CPU mapping for software rasterizers (Mesa softpipe/llvmpipe
        target) plus geometry for dumb-buffer allocation. */

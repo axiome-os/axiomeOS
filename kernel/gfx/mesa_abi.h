@@ -17,6 +17,13 @@ enum axdri_ioctl {
     AXDRI_DUMB_MAP = 0x03,   /* in: handle -> out: offset for mmap */
     AXDRI_DUMB_DESTROY = 0x04,
     AXDRI_PRESENT = 0x05,    /* blit dumb buffer to scanout + flush */
+    AXDRI_GET_CAPS = 0x06,   /* out: axdri_caps (capability flags) */
+};
+
+struct axdri_caps {
+    uint64_t caps;      /* GfxCap bitmask */
+    uint32_t detail;    /* 0=simplified 1=detailed */
+    uint32_t pad;
 };
 
 struct axdri_mode {

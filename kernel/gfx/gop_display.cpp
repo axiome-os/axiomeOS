@@ -49,10 +49,9 @@ bool GopDisplay::init(const GfxMode &mode)
 GfxCaps GopDisplay::caps() const
 {
     GfxCaps c;
-    c.has_hw_fill = 0;
-    c.has_hw_blit = 0;
-    c.has_hw_flip = 0;
-    c.has_3d = 0;
+    // GOP: no acceleration – simplified mode. All bits 0.
+    // Explicitly sync to keep bits consistent.
+    gfx_caps_sync_bits(c);
     return c;
 }
 

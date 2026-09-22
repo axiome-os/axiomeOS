@@ -427,6 +427,20 @@ GfxCaps VirtioGpuDisplay::caps() const
     c.has_hw_blit = 1;
     c.has_hw_flip = 0;
     c.has_3d = virtio_gpu_dev()->has_virgl_3d ? 1 : 0;
+    c.has_alpha = 1;
+    c.has_compositor = 1;
+    c.has_shadows = 1;
+    c.has_vsync = 0;
+    c.has_hw_cursor = 0;
+    c.has_scale = 1;
+    c.has_yuv = 0;
+    c.has_shaders = c.has_3d;
+    c.has_blur = c.has_3d; // blur via shader only when 3D available; otherwise CPU-gated off
+    // Rounded + gradient come for free with compositor
+    c.bits = 0;
+    gfx_caps_sync_bits(c);
+    // Startup self-test: if 3D advertised but capset missing, mask blur/shaders
+    // (kept optimistic; manager will keep bits as-is – mesa probe will fail later)
     return c;
 }
 

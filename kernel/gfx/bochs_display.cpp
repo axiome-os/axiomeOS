@@ -45,6 +45,7 @@ bool BochsDisplay::init(const GfxMode & /*mode*/)
 GfxCaps BochsDisplay::caps() const
 {
     GfxCaps c;
+    gfx_caps_sync_bits(c);
     return c;
 }
 

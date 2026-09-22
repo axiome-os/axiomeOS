@@ -64,6 +64,18 @@ static inline void axdri_encode_destroy(struct axdri_cmd *c, uint32_t handle)
     c->args[5] = 0;
 }
 
+static inline void axdri_encode_get_caps(struct axdri_cmd *c)
+{
+    c->magic = AXDRI_MAGIC;
+    c->op = (uint32_t)AXDRI_GET_CAPS;
+    c->args[0] = 0;
+    c->args[1] = 0;
+    c->args[2] = 0;
+    c->args[3] = 0;
+    c->args[4] = 0;
+    c->args[5] = 0;
+}
+
 /* Pitch/size helpers shared by kernel/dri.c and the winsys (single source
    of truth so Mesa and the kernel can never disagree on layout). */
 static inline uint32_t axdri_pitch_for(uint32_t w)

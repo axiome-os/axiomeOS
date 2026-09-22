@@ -49,10 +49,39 @@ static uint32_t dri_alloc_slot(void)
     return 0;
 }
 
+static long dri_cmd_get_caps(struct axdri_cmd *c)
+{
+    uint64_t bits = 0;
+    int detailed = 0;
+    if (gfx_caps(&bits) == 0) {
+        const char *mode = gfx_detail_mode();
+        detailed = (mode && mode[0] == 'd') ? 1 : 0;
+    }
+    c->args[0] = (uint32_t)(bits & 0xFFFFFFFFu);
+    c->args[1] = (uint32_t)(bits >> 32);
+    c->args[2] = (uint32_t)detailed;
+    c->args[3] = 0;
+    c->args[4] = 0;
+    c->args[5] = 0;
+    return (long)AXDRI_CMD_SIZE;
+}
+
 static long dri_read(struct device *d, uint64_t off, void *buf, size_t len)
 {
     (void)d;
     (void)off;
+    /* GET_CAPS via read when caller asks for axdri_caps size (16) */
+    if (len == sizeof(struct axdri_caps)) {
+        struct axdri_caps caps;
+        uint64_t bits = 0;
+        if (gfx_caps(&bits) < 0) return -1;
+        caps.caps = bits;
+        const char *mode = gfx_detail_mode();
+        caps.detail = (mode && mode[0] == 'd') ? 1u : 0u;
+        caps.pad = 0;
+        __builtin_memcpy(buf, &caps, sizeof(caps));
+        return (long)sizeof(caps);
+    }
     /* GET_MODE: plain read of the active scanout mode. */
     if (len < sizeof(struct axdri_mode))
         return -1;
@@ -201,6 +230,13 @@ static long dri_write(struct device *d, uint64_t off, const void *buf,
             return dri_cmd_destroy(&c);
         case AXDRI_PRESENT:
             return dri_cmd_present(&c);
+        case AXDRI_GET_CAPS:
+        {
+            long r = dri_cmd_get_caps(&c);
+            if (r < 0) return -1;
+            __builtin_memcpy((void *)buf, &c, sizeof(c));
+            return r;
+        }
         case AXDRI_DUMB_MAP: /* covered by the mmap off encoding; no-op */
         case AXDRI_GET_MODE: /* use read() */
         default:

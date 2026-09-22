@@ -20,8 +20,10 @@ int main(void)
     CHECK(offsetof(struct wm_event, y) == 12);
     CHECK(WM_EV_KEY == 1u);
     CHECK(WM_EV_MOUSE == 2u);
-    CHECK(sizeof(struct wm_win_hdr) == 32u);
-    CHECK(WM_HDR_SIZE == 32u);
+    CHECK(sizeof(struct wm_win_hdr) == 48u);
+    CHECK(WM_HDR_SIZE == 48u);
+    CHECK(offsetof(struct wm_win_hdr, gfx_caps) == 32u);
+    CHECK(offsetof(struct wm_win_hdr, gfx_detail) == 40u);
     CHECK(WM_MAGIC == 0x57494E44u);
     /* Fixed geometry must fit one SHM_SLOT (2 MiB) with room for header. */
     CHECK(WM_WIN_W == 620u && WM_WIN_H == 420u);

@@ -91,6 +91,8 @@ static long g_empty_since = -1; /* time(0) when the desktop last went empty */
 static int g_spawn_fails;    /* consecutive auto-reopen failures (backoff) */
 static long g_sess_uid = -1; /* logged-in user: later terminals inherit it */
 static long g_sess_gid = -1; /* (-1 = none yet: terminals stay as spawned) */
+static struct axgui_caps g_caps;
+static int g_caps_ok = 0;
 
 /* Cursor snapshot: pixels under the pointer captured at the last full render,
    so a pointer-only move can erase the old cursor without a full re-render. */
@@ -317,6 +319,8 @@ static struct win *open_client_in(struct win *w, const char *title,
     w->hdr->seq = 0;
     w->hdr->ready = 0;
     w->hdr->gen = g_gencnt;
+    w->hdr->gfx_caps = g_caps.caps;
+    w->hdr->gfx_detail = g_caps.detail;
     /* The read end travels by inheritance; its number goes on the command
        line (no dup2 onto a fixed fd: the target might be one of the pipe's
        own ends, and dup2 would close it first). */
@@ -897,6 +901,8 @@ static void render(struct axgui_fb *fb)
             }
             continue;
         }
+        if (g_caps_ok && (g_caps.caps & AXGUI_CAP_SHADOWS))
+            axgui_shadow(fb, w->x, w->y, (int)WIN_FW, (int)WIN_FH, 0x000000u, 60);
         axgui_fill(fb, w->x, w->y, (int)WIN_FW, (int)WIN_FH, D_WinBG);
         axgui_fill(fb, w->x, w->y, (int)WIN_FW, TITLEBAR, tc);
         axgui_rect(fb, w->x, w->y, (int)WIN_FW, (int)WIN_FH, D_Accent);
@@ -1031,7 +1037,21 @@ int main(int argc, char **argv)
        desktop for the scanout). */
     axgui_grab(input_fd, 1);
     axgui_poll(input_fd, ev, 64);
-    printf("guixd: display server up (%ux%u)\n", fb.w, fb.h);
+    /* Query gfx capabilities (startup tests already ran in kernel). Cache
+       and publish to clients via SHM hdr; GUI will gate blur/shadows. */
+    if (axgui_get_caps(&fb, &g_caps) == 0) {
+        g_caps_ok = 1;
+        printf("guixd: gfx caps 0x%lx detail=%s\n",
+               (unsigned long)g_caps.caps,
+               g_caps.detail ? "detailed" : "simplified");
+        if (!(g_caps.caps & AXGUI_CAP_BLUR))
+            printf("guixd: blur disabled (CPU fallback gated)\n");
+    } else {
+        printf("guixd: gfx caps query failed, assuming simplified\n");
+        g_caps.caps = 0; g_caps.detail = 0;
+    }
+    printf("guixd: display server up (%ux%u) mode=%s\n", fb.w, fb.h,
+           g_caps.detail ? "detailed" : "simplified");
 
     /* Fixed SHM pool: one window segment per slot, owned by the display
        server for its whole lifetime (no per-client churn, nothing to free). */
@@ -1068,8 +1088,13 @@ int main(int argc, char **argv)
     scan_apps();
     boot_session(&fb);
 
+    /* Auto refresh: EMA of frame time + adaptive target */
+    uint64_t avg_us = AXGUI_TARGET_60_US;
+    uint64_t frame_id = 0;
+
     for (;;)
     {
+        uint64_t frame_start_us = axgui_now_us();
         long now = (long)time(0);
         int state_changed = 0;  /* full re-render + present needed */
         int mouse_moved = 0;
@@ -1411,7 +1436,41 @@ int main(int argc, char **argv)
         }
         /* else: idle — no present, nothing pushed over PCIe. */
 
-        axgui_msleep(16);
+        /* ---- auto refresh --- pace to achievable rate instead of fixed 16 ms.
+           Fixed 16 ms + variable render time capped real FPS at ~20 when the
+           compositor had to blit several windows / draw shadows. We measure
+           the frame cost and sleep only the remainder of the target interval,
+           auto-downgrading to 30/20 Hz when the hardware cannot sustain 60. */
+        {
+            uint64_t now_us = axgui_now_us();
+            uint64_t elapsed_us = 0;
+            uint64_t target_us;
+            long remain_us;
+            int active = state_changed || mouse_moved;
+            if (now_us > frame_start_us)
+                elapsed_us = now_us - frame_start_us;
+            /* EMA with bias to recent frames (7/8 old, 1/8 new) */
+            avg_us = (avg_us * 7 + elapsed_us) / 8;
+            if (avg_us < 1000)
+                avg_us = elapsed_us;
+            target_us = axgui_auto_target_us(g_caps_ok ? &g_caps : 0,
+                                             active, avg_us);
+            frame_id++;
+            /* If we already overran the budget, yield immediately; the next
+               frame will see the high avg and auto-step down. */
+            if (elapsed_us >= target_us)
+                sys_yield();
+            else
+            {
+                remain_us = (long)(target_us - elapsed_us);
+                /* Cap idle wakeups: if we are idle for many frames, the EMS
+                   above already picked IDLE_US, but never sleep more than
+                   50 ms so the clock and lifecycle scans stay responsive. */
+                if (!active && remain_us > 50000)
+                    remain_us = 50000;
+                axgui_sleep_us(remain_us);
+            }
+        }
     }
 
     /* The daemon only leaves its loop via a system restart (menu "R
