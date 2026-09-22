@@ -1,6 +1,7 @@
 #include "pmm.h"
 #include "mmap.h"
 #include "printk.h"
+#include <stdbool.h>
 
 #define KERNEL_VIRT_BASE 0xFFFFFFFF80000000ULL
 #define PAGE_SHIFT 12
@@ -85,6 +86,10 @@ void pmm_init(void)
 
     bm_set(0);
     free_frames--;
+    // Reserve low 1M (BIOS IVT/BDA + first 1M hole) for DMA safety - virtio
+    // vring at 0x2000/0xb000 aliases xHCI DCBAA and causes hang at
+    // setup_scanout / xHCI port init. Keep it permanently used.
+    mark_used(0x0, 0x100000);
 
     for (uint64_t a = 0x800000; a < mmap_max_addr; a += 0x200000)
     {
@@ -187,6 +192,37 @@ void *pmm_alloc_frames_below(uint64_t count, uint64_t max_phys)
 void *pmm_alloc_frames_dma32(uint64_t count)
 {
     return pmm_alloc_frames_below(count, 0x100000000ULL);
+}
+
+void *pmm_alloc_frames_high(uint64_t count, uint64_t max_phys)
+{
+    if (count == 0 || max_phys == 0)
+        return 0;
+    uint64_t max_frame = max_phys >> PAGE_SHIFT;
+    if (max_frame == 0)
+        return 0;
+    if (max_frame > total_frames)
+        max_frame = total_frames;
+    if (count > max_frame)
+        return 0;
+    // Search from high to low to avoid low fragmentation alias with xHCI
+    // Like Linux top-down: prefer high <4G for device DMA.
+    for (uint64_t start = max_frame - count; ; start--) {
+        bool ok = true;
+        for (uint64_t j = 0; j < count; j++) {
+            if (bm_test(start + j)) { ok = false; break; }
+        }
+        if (ok) {
+            for (uint64_t j = 0; j < count; j++)
+                bm_set(start + j);
+            free_frames -= count;
+            return (void *)(start << PAGE_SHIFT);
+        }
+        if (start == 0)
+            break;
+    }
+    // Fallback to low scan
+    return pmm_alloc_frames_below(count, max_phys);
 }
 
 void pmm_free_frame(void *addr)

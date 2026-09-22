@@ -4,6 +4,7 @@
 
 #include <stdint.h>
 
+#include <stddef.h>
 #include "axboot.h"
 #include "printk.h"
 #include "framebuffer.h"
@@ -54,6 +55,14 @@ void axboot_parse(struct axboot_info *info)
            (unsigned long)info->kernel_phys_load,
            (unsigned long)info->kernel_size,
            info->cmdline);
+    /* Publish cmdline to hal_bootinfo for gfx property parsing etc. */
+    {
+        struct hal_bootinfo *bi_cmd = hal_bootinfo();
+        size_t i = 0;
+        for (; i < sizeof(bi_cmd->cmdline) - 1 && info->cmdline[i]; i++)
+            bi_cmd->cmdline[i] = info->cmdline[i];
+        bi_cmd->cmdline[i] = '\0';
+    }
 
     /* Memory map. */
     kernel_mmap.count = 0;

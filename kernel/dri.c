@@ -82,9 +82,19 @@ static long dri_cmd_create(struct axdri_cmd *c)
     uint32_t pitch = axdri_pitch_for(w);
     uint64_t size = axdri_size_for(w, h);
     uint64_t pages = (size + PAGE_SIZE - 1) >> PAGE_SHIFT;
-    void *phys = pmm_alloc_frames(pages);
+    void *phys = pmm_alloc_frames_high(pages, 0x100000000ULL);
+    if (!phys) phys = pmm_alloc_frames(pages);
     if (!phys)
         return -1;
+    if ((uintptr_t)phys < 0x100000) {
+        void *phys2 = pmm_alloc_frames_high(pages, 0x100000000ULL);
+        if (phys2 && (uintptr_t)phys2 >= 0x100000) {
+            pmm_free_frames(phys, pages);
+            phys = phys2;
+        } else if (phys2) {
+            pmm_free_frames(phys2, pages);
+        }
+    }
     __builtin_memset((void *)(uintptr_t)phys, 0, (size_t)size);
     struct dri_buf *b = &g_bufs[handle - 1];
     b->used = 1;

@@ -10,6 +10,7 @@ void *pmm_alloc_frame(void);
 void *pmm_alloc_frames(uint64_t count);
 void *pmm_alloc_frames_below(uint64_t count, uint64_t max_phys);
 void *pmm_alloc_frames_dma32(uint64_t count);
+void *pmm_alloc_frames_high(uint64_t count, uint64_t max_phys);
 void pmm_free_frame(void *addr);
 void pmm_free_frames(void *addr, uint64_t count);
 uint64_t pmm_free_count(void);

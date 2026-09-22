@@ -23,6 +23,7 @@ struct hal_bootinfo
     uint8_t   fb_type;
     uint64_t  mmap_max_addr;
     void     *acpi_rsdp;
+    char      cmdline[256];
 };
 
 struct hal_bootinfo *hal_bootinfo(void);

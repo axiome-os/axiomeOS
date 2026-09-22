@@ -39,7 +39,8 @@ private:
     uint64_t fb_phys_ = 0;
     uint32_t fb_pages_ = 0;
     uint32_t fb_size_ = 0;
-    uint32_t fb_resource_id_ = 1;
+    uint32_t fb_resource_id_ = 0;
+    uint32_t ctx_id_ = 0; /* virgl context for 3D */
 };
 
 VirtioGpuDisplay *virtio_gpu_display_create(void);

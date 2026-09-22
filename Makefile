@@ -6,6 +6,18 @@ HOSTCC := gcc
 
 DEV ?= /dev/sdx
 
+# QEMU 3D: virtio-gpu VirGL. Requires host virglrenderer + GL display (Linux-like).
+# See ~/linux/drivers/gpu/drm/virtio/virtgpu_drv.c:features[] + virtio_has_feature().
+# Default is 3D (virgl) like Linux DRM_VIRTIO_GPU_KMS; for 2D fallback:
+#   make run-2d                # sdl + virtio-vga (no virgl, no gl)
+#   make run QEMU_DISPLAY=sdl QEMU_GPU_DEVICE=virtio-vga
+# For Venus/GFXStream (blob): make run QEMU_GPU_DEVICE="virtio-gpu-gl-pci,hostmem=4G,blob=true"
+QEMU_DISPLAY ?= sdl,gl=on
+QEMU_GPU_DEVICE ?= virtio-vga-gl
+# Linux-like aliases: discrete vs integrated VGA variant
+QEMU_GPU_2D ?= virtio-vga
+QEMU_DISPLAY_2D ?= sdl
+
 # Partition geometry (must stay in sync with tools/mkpart.py).
 BOOT_PART_LBA     := 2048
 BOOT_PART_SECTORS := 129024
@@ -26,7 +38,7 @@ DISK_PATH := $(BUILD_DIR)/disk.img
 # of them changes (a userspace .elf or a .kxt), the ROOT partition rebuilds.
 MANIFEST_BINS := $(shell sed -n 's/.*[[:space:]]bin:\([^[:space:]]*\).*/\1/p' root_manifest.txt)
 
-.PHONY: all kernel bootloader iso run run-iso run-fb run-usb debug test test-hid clean distclean install disk.img
+.PHONY: all kernel bootloader iso run run-2d run-3d run-venus run-iso run-fb run-usb debug test test-hid clean distclean install disk.img
 
 all: iso
 
@@ -125,8 +137,30 @@ disk.img: $(DISK_PATH)
 run: disk.img
 	qemu-system-x86_64 -bios /usr/share/ovmf/OVMF.fd \
 		-drive file=$(BUILD_DIR)/disk.img,format=raw,if=ide,index=0,media=disk \
-		-m 512M -serial stdio -display sdl \
-		-vga virtio \
+		-m 512M -serial stdio -display $(QEMU_DISPLAY) \
+		-device $(QEMU_GPU_DEVICE) \
+		-netdev user,id=net0 \
+		-device virtio-net-pci,netdev=net0
+
+# Linux-like 2D fallback (no virgl, like DRM_VIRTIO_GPU_KMS=n or VIRGL not offered)
+run-2d: disk.img
+	qemu-system-x86_64 -bios /usr/share/ovmf/OVMF.fd \
+		-drive file=$(BUILD_DIR)/disk.img,format=raw,if=ide,index=0,media=disk \
+		-m 512M -serial stdio -display $(QEMU_DISPLAY_2D) \
+		-device $(QEMU_GPU_2D) \
+		-netdev user,id=net0 \
+		-device virtio-net-pci,netdev=net0
+
+# Explicit 3D alias (same as default run, for symmetry)
+run-3d: run
+
+# Venus/GFXStream blob path (Linux virtio_gpu_object.c blob + host_visible_mm)
+# Requires QEMU 6.0+ with -object memory-backend-memfd and hostmem
+run-venus: disk.img
+	qemu-system-x86_64 -bios /usr/share/ovmf/OVMF.fd \
+		-drive file=$(BUILD_DIR)/disk.img,format=raw,if=ide,index=0,media=disk \
+		-m 512M -serial stdio -display sdl,gl=on \
+		-device virtio-gpu-gl-pci,hostmem=4G,blob=true,venus=true \
 		-netdev user,id=net0 \
 		-device virtio-net-pci,netdev=net0
 
@@ -134,21 +168,21 @@ run-iso: iso disk.img
 	qemu-system-x86_64 -bios /usr/share/ovmf/OVMF.fd \
 		-cdrom $(BUILD_DIR)/axiome.iso \
 		-drive file=$(BUILD_DIR)/disk.img,format=raw,if=ide,index=0,media=disk \
-		-m 512M -serial stdio -display sdl \
-		-vga virtio \
+		-m 512M -serial stdio -display $(QEMU_DISPLAY) \
+		-device $(QEMU_GPU_DEVICE) \
 		-netdev user,id=net0 \
 		-device virtio-net-pci,netdev=net0
 
 run-fb: disk.img
 	qemu-system-x86_64 -bios /usr/share/ovmf/OVMF.fd \
 		-drive file=$(BUILD_DIR)/disk.img,format=raw,if=ide,index=0,media=disk \
-		-m 512M -serial stdio -vga virtio -display sdl
+		-m 512M -serial stdio -display $(QEMU_DISPLAY) -device $(QEMU_GPU_DEVICE)
 
 run-usb: disk.img
 	qemu-system-x86_64 -bios /usr/share/ovmf/OVMF.fd \
 		-drive file=$(BUILD_DIR)/disk.img,format=raw,if=ide,index=0,media=disk \
-		-m 512M -serial stdio -display sdl \
-		-vga virtio \
+		-m 512M -serial stdio -display $(QEMU_DISPLAY) \
+		-device $(QEMU_GPU_DEVICE) \
 		-device qemu-xhci,id=xhci -device usb-kbd,bus=xhci.0 \
 		-device usb-mouse,bus=xhci.0 \
 		-netdev user,id=net0 \
@@ -265,7 +299,7 @@ test-hid: $(BUILD_DIR)/tests/hid_boot_test
 debug: disk.img
 	qemu-system-x86_64 -bios /usr/share/ovmf/OVMF.fd \
 		-drive file=$(BUILD_DIR)/disk.img,format=raw,if=ide,index=0,media=disk \
-		-m 512M -serial stdio -s -S
+		-m 512M -serial stdio -display $(QEMU_DISPLAY) -device $(QEMU_GPU_DEVICE) -s -S
 
 install: disk.img
 	sudo $(shell pwd)/tools/install.sh $(DEV) $(BUILD_DIR)

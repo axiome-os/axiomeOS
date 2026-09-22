@@ -73,13 +73,36 @@ inline bool clip_rect(GfxRect &r, uint32_t width, uint32_t height)
 }
 
 /* Acceleration capabilities: what a backend can do without CPU pixel
-   pushing. GOP provides none; Intel provides blit/fill once GTT + engine
-   init lands. Mesa queries this to decide client vs GPU submission. */
+    pushing. GOP provides none; Intel provides blit/fill once GTT + engine
+    init lands. Mesa queries this to decide client vs GPU submission. */
 struct GfxCaps {
     int has_hw_fill = 0;
     int has_hw_blit = 0;
     int has_hw_flip = 0; /* async page-flip / vsync */
     int has_3d = 0;      /* 3D engine available (i915/Xe) */
+};
+
+/* Per-driver disable flags (bitmask). GOP is never disabled – it's the
+    fallback. Used by GfxProperties::disable_mask. */
+enum GfxDriverFlag : uint32_t {
+    GFX_DRIVER_VIRTIO = 1u << 0,
+    GFX_DRIVER_BOCHS = 1u << 1,
+    GFX_DRIVER_INTEL = 1u << 2,
+    GFX_DRIVER_ALL = GFX_DRIVER_VIRTIO | GFX_DRIVER_BOCHS | GFX_DRIVER_INTEL,
+};
+
+/* Runtime knobs for the display manager. Temporary / bring-up helper:
+    flip `disable_drivers` or `disable_mask` in code (or via the C API) to
+    force-fallback to GOP without deleting driver objects.
+
+    Examples (in C++ code, before gfx_init()):
+      gfx::display_manager().properties().disable_drivers = true; // all off
+      gfx::display_manager().properties().disable_mask = GFX_DRIVER_INTEL;
+      gfx::display_manager().properties().disable_mask = GFX_DRIVER_VIRTIO | GFX_DRIVER_INTEL;
+ */
+struct GfxProperties {
+    bool disable_drivers = false;  /* master kill-switch: only GOP remains */
+    uint32_t disable_mask = 0;     /* per-driver mask when master is false */
 };
 
 } /* namespace gfx */
