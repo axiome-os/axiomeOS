@@ -33,48 +33,48 @@ Libraries/      0755 0  0  d
 # User binaries (embedded host ELFs, written verbatim under /Binaries).
 # Friendly /bin remains a read-only alias that resolves to /Binaries.
 # Host paths are relative to the repository root and resolved at mkfs time.
-Binaries/init           0755  0  0  f  bin:kernel/userspace/init.elf
-Binaries/sh             0755  0  0  f  bin:kernel/userspace/sh.elf
-Binaries/syslogd        0755  0  0  f  bin:kernel/userspace/syslogd.elf
-Binaries/ls             0755  0  0  f  bin:kernel/userspace/ls.elf
-Binaries/cat             0755  0  0  f  bin:kernel/userspace/cat.elf
-Binaries/echo           0755  0  0  f  bin:kernel/userspace/echo.elf
-Binaries/mkdir          0755  0  0  f  bin:kernel/userspace/mkdir.elf
-Binaries/cp             0755  0  0  f  bin:kernel/userspace/cp.elf
-Binaries/mv             0755  0  0  f  bin:kernel/userspace/mv.elf
-Binaries/rm             0755  0  0  f  bin:kernel/userspace/rm.elf
-Binaries/touch          0755  0  0  f  bin:kernel/userspace/touch.elf
-Binaries/whoami         0755  0  0  f  bin:kernel/userspace/whoami.elf
-Binaries/uname          0755  0  0  f  bin:kernel/userspace/uname.elf
-Binaries/login          0755  0  0  f  bin:kernel/userspace/login.elf
-Binaries/oobe           0755  0  0  f  bin:kernel/userspace/oobe.elf
-Binaries/su             0755  0  0  f  bin:kernel/userspace/su.elf
-Binaries/chmod          0755  0  0  f  bin:kernel/userspace/chmod.elf
-Binaries/chown          0755  0  0  f  bin:kernel/userspace/chown.elf
-Binaries/hello          0755  0  0  f  bin:kernel/userspace/hello.elf
-Binaries/vfs_test       0755  0  0  f  bin:kernel/userspace/vfs_test.elf
-Binaries/ipc_test       0755  0  0  f  bin:kernel/userspace/ipc_test.elf
-Binaries/proc_test      0755  0  0  f  bin:kernel/userspace/proc_test.elf
-Binaries/driver_test       0755  0  0  f  bin:kernel/userspace/driver_test.elf
-Binaries/net_test           0755  0  0  f  bin:kernel/userspace/net_test.elf
-Binaries/kill               0755  0  0  f  bin:kernel/userspace/kill.elf
-Binaries/kxtload            0755  0  0  f  bin:kernel/userspace/kxtload.elf
-Binaries/kxtunload          0755  0  0  f  bin:kernel/userspace/kxtunload.elf
-Binaries/date               0755  0  0  f  bin:kernel/userspace/date.elf
-Binaries/ping               0755  0  0  f  bin:kernel/userspace/ping.elf
-Binaries/gfx_test           0755  0  0  f  bin:kernel/userspace/gfx_test.elf
-Binaries/axwm               0755  0  0  f  bin:kernel/userspace/axwm.elf
-Binaries/guixd               0755  0  0  f  bin:kernel/userspace/guixd.elf
-Binaries/axterm             0755  0  0  f  bin:kernel/userspace/axterm.elf
-Binaries/evtest             0755  0  0  f  bin:kernel/userspace/evtest.elf
-Binaries/axinfo             0755  0  0  f  bin:kernel/userspace/axinfo.elf
-Binaries/axlogin            0755  0  0  f  bin:kernel/userspace/axlogin.elf
-Binaries/axoobe             0755  0  0  f  bin:kernel/userspace/axoobe.elf
+Binaries/init           0755  0  0  f  bin:userspace/init.elf
+Binaries/sh             0755  0  0  f  bin:userspace/sh.elf
+Binaries/syslogd        0755  0  0  f  bin:userspace/syslogd.elf
+Binaries/ls             0755  0  0  f  bin:userspace/ls.elf
+Binaries/cat             0755  0  0  f  bin:userspace/cat.elf
+Binaries/echo           0755  0  0  f  bin:userspace/echo.elf
+Binaries/mkdir          0755  0  0  f  bin:userspace/mkdir.elf
+Binaries/cp             0755  0  0  f  bin:userspace/cp.elf
+Binaries/mv             0755  0  0  f  bin:userspace/mv.elf
+Binaries/rm             0755  0  0  f  bin:userspace/rm.elf
+Binaries/touch          0755  0  0  f  bin:userspace/touch.elf
+Binaries/whoami         0755  0  0  f  bin:userspace/whoami.elf
+Binaries/uname          0755  0  0  f  bin:userspace/uname.elf
+Binaries/login          0755  0  0  f  bin:userspace/login.elf
+Binaries/oobe           0755  0  0  f  bin:userspace/oobe.elf
+Binaries/su             0755  0  0  f  bin:userspace/su.elf
+Binaries/chmod          0755  0  0  f  bin:userspace/chmod.elf
+Binaries/chown          0755  0  0  f  bin:userspace/chown.elf
+Binaries/hello          0755  0  0  f  bin:userspace/hello.elf
+Binaries/vfs_test       0755  0  0  f  bin:userspace/vfs_test.elf
+Binaries/ipc_test       0755  0  0  f  bin:userspace/ipc_test.elf
+Binaries/proc_test      0755  0  0  f  bin:userspace/proc_test.elf
+Binaries/driver_test       0755  0  0  f  bin:userspace/driver_test.elf
+Binaries/net_test           0755  0  0  f  bin:userspace/net_test.elf
+Binaries/kill               0755  0  0  f  bin:userspace/kill.elf
+Binaries/kxtload            0755  0  0  f  bin:userspace/kxtload.elf
+Binaries/kxtunload          0755  0  0  f  bin:userspace/kxtunload.elf
+Binaries/date               0755  0  0  f  bin:userspace/date.elf
+Binaries/ping               0755  0  0  f  bin:userspace/ping.elf
+Binaries/gfx_test           0755  0  0  f  bin:userspace/gfx_test.elf
+Binaries/axwm               0755  0  0  f  bin:userspace/axwm.elf
+Binaries/guixd               0755  0  0  f  bin:userspace/guixd.elf
+Binaries/axterm             0755  0  0  f  bin:userspace/axterm.elf
+Binaries/evtest             0755  0  0  f  bin:userspace/evtest.elf
+Binaries/axinfo             0755  0  0  f  bin:userspace/axinfo.elf
+Binaries/axlogin            0755  0  0  f  bin:userspace/axlogin.elf
+Binaries/axoobe             0755  0  0  f  bin:userspace/axoobe.elf
 
 # Shared C library, loaded by the kernel's dynamic linker when a binary has a
 # DT_NEEDED entry (see kernel/dynlink.c search paths). Libraries live under
 # /Libraries (the /Binaries layout used to hold it).
-Libraries/libc.sl    0755  0  0  f  bin:kernel/userspace/libc.sl
+Libraries/libc.sl    0755  0  0  f  bin:userspace/libc.sl
 
 # Loadable kernel modules (.kxt). Built by kernel/modules/Makefile into the
 # source tree and embedded here so init can load them at boot. (sata/nvme

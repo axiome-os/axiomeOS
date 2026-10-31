@@ -8,9 +8,8 @@ axfs.img
 ovmf_vars.fd
 
 # ELF binaries (userspace, built from sources)
-kernel/userspace/*.elf
-kernel/userspace/*.sl
-kernel/modules/*.kxt
+userspace/*.elf
+userspace/*.sl
 
 # Editor/OS files
 *.swp

@@ -5,7 +5,7 @@
  * Single source of truth for syscall numbers.
  *
  * Both the kernel (kernel/syscall.h via the table in syscall.c) and the
- * userspace libc (kernel/userspace/libc/syscall.h) must agree on these
+ * userspace libc (userspace/libc/syscall.h) must agree on these
  * numbers.  They were previously copy-pasted into two headers with no build
  * time check, so a mismatch silently corrupted the ABI.  Now both headers
  * include THIS file, and a pointer-size static assertion in syscall.c links

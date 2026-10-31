@@ -4,6 +4,12 @@ BUILD_DIR := $(REPO_ROOT)/build
 PYTHON := python3
 HOSTCC := gcc
 
+# Cross-compiler for building kernel + userspace (freestanding axiome ELFs)
+CC      := $(HOME)/opt/cross/bin/x86_64-elf-gcc
+CXX     := $(HOME)/opt/cross/bin/x86_64-elf-g++
+AS      := $(HOME)/opt/cross/bin/x86_64-elf-as
+LD      := $(HOME)/opt/cross/bin/x86_64-elf-ld
+
 DEV ?= /dev/sdx
 
 # QEMU 3D: virtio-gpu VirGL. Requires host virglrenderer + GL display (Linux-like).
@@ -38,15 +44,61 @@ DISK_PATH := $(BUILD_DIR)/disk.img
 # of them changes (a userspace .elf or a .kxt), the ROOT partition rebuilds.
 MANIFEST_BINS := $(shell sed -n 's/.*[[:space:]]bin:\([^[:space:]]*\).*/\1/p' root_manifest.txt)
 
-.PHONY: all kernel bootloader iso run run-2d run-3d run-venus run-iso run-fb run-usb debug test test-hid clean distclean install disk.img
+.PHONY: all kernel bootloader userspace iso run run-2d run-3d run-venus run-iso run-fb run-usb debug test test-hid clean distclean install disk.img
 
 all: iso
 
-kernel:
+kernel: userspace
 	$(MAKE) -C kernel BUILD_DIR=$(BUILD_DIR)/kernel
 
 bootloader:
 	$(MAKE) -C bootloader
+
+userspace: $(USER_ELFS) $(LIBC_SL)
+
+USER_PROGS := init hello cat echo sh ls mkdir cp mv rm touch whoami uname \
+	login su chmod chown vfs_test ipc_test proc_test driver_test net_test \
+	kill kxtload kxtunload syslogd oobe date burn forkt ping gfx_test \
+	axwm axterm evtest axinfo guixd axlogin axoobe
+USER_ELFS := $(addprefix userspace/,$(addsuffix .elf,$(USER_PROGS)))
+
+USER_BASE_CFLAGS := -ffreestanding -nostdlib -nostartfiles -fno-builtin \
+	-fno-stack-protector -fPIC -mcmodel=small -O2 -g -pipe \
+	-mno-red-zone -Wall -Wextra -I userspace/libc
+USER_CFLAGS := $(USER_BASE_CFLAGS) -fpie
+
+LIBC_CFLAGS := $(USER_BASE_CFLAGS)
+
+CRT0_OBJ := $(BUILD_DIR)/user_crt0.o
+
+LIBC_SRCS := userspace/libc/errno.c userspace/libc/string.c \
+	userspace/libc/stdlib.c userspace/libc/stdio.c \
+	userspace/libc/syscall.c userspace/libc/signal.c \
+	userspace/libc/time.c
+LIBC_OBJS := $(patsubst userspace/libc/%.c, $(BUILD_DIR)/libc_%.o, $(LIBC_SRCS))
+LIBC_SL := userspace/libc.sl
+
+$(BUILD_DIR)/user_crt0.o: userspace/libc/crt0.c
+	@mkdir -p $(@D)
+	$(CC) $(USER_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/libc_%.o: userspace/libc/%.c
+	@mkdir -p $(@D)
+	$(CC) $(LIBC_CFLAGS) -c $< -o $@
+
+$(LIBC_SL): $(LIBC_OBJS) userspace/libc.ld
+	@mkdir -p $(@D)
+	$(LD) -shared -T userspace/libc.ld --hash-style=sysv \
+		-soname libc.sl -z max-page-size=0x1000 -o $@ $(LIBC_OBJS)
+
+userspace/%.elf: $(BUILD_DIR)/%_user.o $(CRT0_OBJ) $(LIBC_SL)
+	@mkdir -p $(@D)
+	$(LD) -pie -T userspace/link.ld --hash-style=sysv \
+		-z max-page-size=0x1000 -e _start -o $@ $^
+
+$(BUILD_DIR)/%_user.o: userspace/%.c
+	@mkdir -p $(@D)
+	$(CC) $(USER_CFLAGS) -c $< -o $@
 
 # Host-side axiomefs formatter (enhanced to take a disk image + offset).
 $(BUILD_DIR)/kernel/mkfs_axiomefs: tools/mkfs_axiomefs.c
@@ -195,7 +247,7 @@ run-usb: disk.img
 # ---------------------------------------------------------------------------
 TEST_CFLAGS := -std=c11 -O2 -Wall -Wextra -Werror -fno-builtin
 KERNEL_INC  := -I$(REPO_ROOT)/kernel
-LIBC_INC    := -I$(REPO_ROOT)/kernel/userspace/libc
+LIBC_INC    := -I$(REPO_ROOT)/userspace/libc
 LIBC_STUBS  := tests/libc_stubs_host.c
 
 KERNEL_TESTS := \
@@ -273,23 +325,23 @@ $(BUILD_DIR)/tests/dynlink_regress_test: tests/dynlink_regress_test.c kernel/dyn
 	$(HOSTCC) $(TEST_CFLAGS) $(KERNEL_INC) -o $@ tests/dynlink_regress_test.c kernel/dynlink.c
 
 $(BUILD_DIR)/tests/libc_string_test: tests/libc_string_test.c \
-		kernel/userspace/libc/string.c kernel/userspace/libc/stdlib.c $(LIBC_STUBS)
+		userspace/libc/string.c userspace/libc/stdlib.c $(LIBC_STUBS)
 	@mkdir -p $(@D)
 	$(HOSTCC) $(TEST_CFLAGS) $(LIBC_INC) -o $@ $^
 
 $(BUILD_DIR)/tests/libc_stdlib_test: tests/libc_stdlib_test.c \
-		kernel/userspace/libc/string.c kernel/userspace/libc/stdlib.c $(LIBC_STUBS)
+		userspace/libc/string.c userspace/libc/stdlib.c $(LIBC_STUBS)
 	@mkdir -p $(@D)
 	$(HOSTCC) $(TEST_CFLAGS) $(LIBC_INC) -o $@ $^
 
 $(BUILD_DIR)/tests/libc_time_test: tests/libc_time_test.c \
-		kernel/userspace/libc/time.c $(LIBC_STUBS)
+		userspace/libc/time.c $(LIBC_STUBS)
 	@mkdir -p $(@D)
 	$(HOSTCC) $(TEST_CFLAGS) $(LIBC_INC) -o $@ $^
 
 $(BUILD_DIR)/tests/libc_stdio_test: tests/libc_stdio_test.c \
-		kernel/userspace/libc/stdio.c kernel/userspace/libc/string.c \
-		kernel/userspace/libc/stdlib.c $(LIBC_STUBS)
+		userspace/libc/stdio.c userspace/libc/string.c \
+		userspace/libc/stdlib.c $(LIBC_STUBS)
 	@mkdir -p $(@D)
 	$(HOSTCC) $(TEST_CFLAGS) -Wno-unused-function $(LIBC_INC) -o $@ $^
 
@@ -307,7 +359,7 @@ install: disk.img
 clean:
 	rm -rf $(BUILD_DIR)/isodir $(BUILD_DIR)/isowork $(BUILD_DIR)/boot.fat \
 		$(BUILD_DIR)/esp.img $(BUILD_DIR)/root.axfs $(BUILD_DIR)/disk.img \
-		$(BUILD_DIR)/axiome.iso
+		$(BUILD_DIR)/axiome.iso userspace/libc.sl
 	$(MAKE) -C kernel clean BUILD_DIR=$(BUILD_DIR)/kernel
 	$(MAKE) -C bootloader clean
 
