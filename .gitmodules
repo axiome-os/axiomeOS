@@ -4,3 +4,6 @@
 [submodule "kernel"]
 	path = kernel
 	url = git@github.com:axiome-os/axiomeKernel.git
+[submodule "bootloader"]
+	path = bootloader
+	url = git@github.com:axiome-os/axiomeBootloader.git
