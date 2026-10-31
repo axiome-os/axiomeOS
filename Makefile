@@ -54,8 +54,7 @@ kernel: userspace
 bootloader:
 	$(MAKE) -C bootloader
 
-userspace: $(USER_ELFS) $(LIBC_SL)
-
+# Userspace build variables (defined before the target so prerequisites expand at parse time)
 USER_PROGS := init hello cat echo sh ls mkdir cp mv rm touch whoami uname \
 	login su chmod chown vfs_test ipc_test proc_test driver_test net_test \
 	kill kxtload kxtunload syslogd oobe date burn forkt ping gfx_test \
@@ -64,7 +63,7 @@ USER_ELFS := $(addprefix userspace/,$(addsuffix .elf,$(USER_PROGS)))
 
 USER_BASE_CFLAGS := -ffreestanding -nostdlib -nostartfiles -fno-builtin \
 	-fno-stack-protector -fPIC -mcmodel=small -O2 -g -pipe \
-	-mno-red-zone -Wall -Wextra -I userspace/libc
+	-mno-red-zone -Wall -Wextra -I userspace/libc -I$(REPO_ROOT)/kernel
 USER_CFLAGS := $(USER_BASE_CFLAGS) -fpie
 
 LIBC_CFLAGS := $(USER_BASE_CFLAGS)
@@ -77,6 +76,9 @@ LIBC_SRCS := userspace/libc/errno.c userspace/libc/string.c \
 	userspace/libc/time.c
 LIBC_OBJS := $(patsubst userspace/libc/%.c, $(BUILD_DIR)/libc_%.o, $(LIBC_SRCS))
 LIBC_SL := userspace/libc.sl
+
+userspace: $(USER_ELFS) $(LIBC_SL)
+	@:
 
 $(BUILD_DIR)/user_crt0.o: userspace/libc/crt0.c
 	@mkdir -p $(@D)

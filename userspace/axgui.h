@@ -21,11 +21,11 @@
 #include <stdint.h>
 
 /* Single source of truth with the kernel (kernel/input_abi.h). */
-#include "../input_abi.h"
+#include "input_abi.h"
 /* Compositor <-> client protocol (kernel/wm_abi.h). */
-#include "../wm_abi.h"
+#include "wm_abi.h"
 /* 8x16 console font (kernel/font8x16.h). */
-#include "../font8x16.h"
+#include "font8x16.h"
 
 /* ---- DRI wire protocol (mirrors kernel/axdri_cmd.h) ---- */
 #define AXGUI_DRI_MAGIC 0x41584452u

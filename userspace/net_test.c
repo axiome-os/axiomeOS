@@ -10,9 +10,9 @@
  *   4. TCP HTTP GET to 10.0.2.2:8080 (host python http.server).
  */
 
-#include "../libc/syscall.h"
-#include "../libc/stdio.h"
-#include "../libc/string.h"
+#include "libc/syscall.h"
+#include "libc/stdio.h"
+#include "libc/string.h"
 #include <stddef.h>
 
 static unsigned short htons(unsigned short v) { return (v >> 8) | (v << 8); }

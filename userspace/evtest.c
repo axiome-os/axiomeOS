@@ -11,7 +11,7 @@
 #include "time.h"
 #include <stdint.h>
 
-#include "../input_abi.h"
+#include "input_abi.h"
 
 int main(int argc, char **argv)
 {

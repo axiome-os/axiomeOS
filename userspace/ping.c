@@ -4,9 +4,9 @@
  *   ping <dotted-quad>
  */
 
-#include "../libc/syscall.h"
-#include "../libc/stdio.h"
-#include "../libc/string.h"
+#include "libc/syscall.h"
+#include "libc/stdio.h"
+#include "libc/string.h"
 
 static unsigned int htonl(unsigned int v)
 {
