@@ -1,14 +1,20 @@
 REPO_ROOT := $(realpath .)
 BUILD_DIR := $(REPO_ROOT)/build
 
-PYTHON := python3
-HOSTCC := gcc
+# Tool locations are overridable via environment or command line, e.g.:
+#   make CROSS_PREFIX=/opt/axiome/cross/bin CC=...
+#   make OVMF=/path/to/OVMF.fd EFI_PREFIX=/usr SUDO=
+PYTHON      ?= python3
+HOSTCC      ?= gcc
+CROSS_PREFIX ?= $(HOME)/opt/cross/bin
+OVMF        ?= /usr/share/ovmf/OVMF.fd
+SUDO        ?= sudo
 
 # Cross-compiler for building kernel + userspace (freestanding axiome ELFs)
-CC      := $(HOME)/opt/cross/bin/x86_64-elf-gcc
-CXX     := $(HOME)/opt/cross/bin/x86_64-elf-g++
-AS      := $(HOME)/opt/cross/bin/x86_64-elf-as
-LD      := $(HOME)/opt/cross/bin/x86_64-elf-ld
+CC      ?= $(CROSS_PREFIX)/x86_64-elf-gcc
+CXX     ?= $(CROSS_PREFIX)/x86_64-elf-g++
+AS      ?= $(CROSS_PREFIX)/x86_64-elf-as
+LD      ?= $(CROSS_PREFIX)/x86_64-elf-ld
 
 DEV ?= /dev/sdx
 
@@ -157,7 +163,7 @@ ROOT_STAMP := $(BUILD_DIR)/.stamp-root
 $(DISK_PATH): kernel bootloader $(BUILD_DIR)/kernel/mkfs_axiomefs $(BOOT_FAT) $(ROOT_AXFS) tools/mkpart.py
 	@mkdir -p $(BUILD_DIR)
 	@target=$(DISK_PATH); \
-	if [ ! -f "$$target" ] || [ tools/mkpart.py -nt "$$target" ]; then \
+		if [ ! -f "$$target" ] || find tools/mkpart.py -newer "$$target" >/dev/null 2>&1; then \
 		printf '%s\n' 'disk.img: creating fresh image + MBR'; \
 		dd if=/dev/zero of="$$target" bs=512 count=$(DISK_SECTORS) 2>/dev/null; \
 		$(PYTHON) tools/mkpart.py "$$target"; \
@@ -165,10 +171,10 @@ $(DISK_PATH): kernel bootloader $(BUILD_DIR)/kernel/mkfs_axiomefs $(BOOT_FAT) $(
 	else \
 		need_boot=0; need_root=0; \
 	fi; \
-	if [ ! -f "$(BOOT_STAMP)" ] || [ $(BOOT_FAT) -nt "$(BOOT_STAMP)" ]; then \
+	if [ ! -f "$(BOOT_STAMP)" ] || find $(BOOT_FAT) -newer $(BOOT_STAMP) >/dev/null 2>&1; then \
 		need_boot=1; \
 	fi; \
-	if [ ! -f "$(ROOT_STAMP)" ] || [ $(ROOT_AXFS) -nt "$(ROOT_STAMP)" ]; then \
+	if [ ! -f "$(ROOT_STAMP)" ] || find $(ROOT_AXFS) -newer $(ROOT_STAMP) >/dev/null 2>&1; then \
 		need_root=1; \
 	fi; \
 	if [ "$$need_boot" -eq 1 ]; then \
@@ -189,7 +195,7 @@ disk.img: $(DISK_PATH)
 # Default boot: the axboot UEFI loader on disk.img, straight into OVMF.
 # No CD-ROM needed. `run-iso` keeps the ISO path for hardware testing.
 run: disk.img
-	qemu-system-x86_64 -bios /usr/share/ovmf/OVMF.fd \
+	qemu-system-x86_64 -bios $(OVMF) \
 		-drive file=$(BUILD_DIR)/disk.img,format=raw,if=ide,index=0,media=disk \
 		-m 512M -serial stdio -display $(QEMU_DISPLAY) \
 		-device $(QEMU_GPU_DEVICE) \
@@ -198,7 +204,7 @@ run: disk.img
 
 # Linux-like 2D fallback (no virgl, like DRM_VIRTIO_GPU_KMS=n or VIRGL not offered)
 run-2d: disk.img
-	qemu-system-x86_64 -bios /usr/share/ovmf/OVMF.fd \
+	qemu-system-x86_64 -bios $(OVMF) \
 		-drive file=$(BUILD_DIR)/disk.img,format=raw,if=ide,index=0,media=disk \
 		-m 512M -serial stdio -display $(QEMU_DISPLAY_2D) \
 		-device $(QEMU_GPU_2D) \
@@ -211,7 +217,7 @@ run-3d: run
 # Venus/GFXStream blob path (Linux virtio_gpu_object.c blob + host_visible_mm)
 # Requires QEMU 6.0+ with -object memory-backend-memfd and hostmem
 run-venus: disk.img
-	qemu-system-x86_64 -bios /usr/share/ovmf/OVMF.fd \
+	qemu-system-x86_64 -bios $(OVMF) \
 		-drive file=$(BUILD_DIR)/disk.img,format=raw,if=ide,index=0,media=disk \
 		-m 512M -serial stdio -display sdl,gl=on \
 		-device virtio-gpu-gl-pci,hostmem=4G,blob=true,venus=true \
@@ -219,7 +225,7 @@ run-venus: disk.img
 		-device virtio-net-pci,netdev=net0
 
 run-iso: iso disk.img
-	qemu-system-x86_64 -bios /usr/share/ovmf/OVMF.fd \
+	qemu-system-x86_64 -bios $(OVMF) \
 		-cdrom $(BUILD_DIR)/axiome.iso \
 		-drive file=$(BUILD_DIR)/disk.img,format=raw,if=ide,index=0,media=disk \
 		-m 512M -serial stdio -display $(QEMU_DISPLAY) \
@@ -228,12 +234,12 @@ run-iso: iso disk.img
 		-device virtio-net-pci,netdev=net0
 
 run-fb: disk.img
-	qemu-system-x86_64 -bios /usr/share/ovmf/OVMF.fd \
+	qemu-system-x86_64 -bios $(OVMF) \
 		-drive file=$(BUILD_DIR)/disk.img,format=raw,if=ide,index=0,media=disk \
 		-m 512M -serial stdio -display $(QEMU_DISPLAY) -device $(QEMU_GPU_DEVICE)
 
 run-usb: disk.img
-	qemu-system-x86_64 -bios /usr/share/ovmf/OVMF.fd \
+	qemu-system-x86_64 -bios $(OVMF) \
 		-drive file=$(BUILD_DIR)/disk.img,format=raw,if=ide,index=0,media=disk \
 		-m 512M -serial stdio -display $(QEMU_DISPLAY) \
 		-device $(QEMU_GPU_DEVICE) \
@@ -279,7 +285,7 @@ $(BUILD_DIR)/tests/hid_boot_test: tests/hid_boot_test.c kernel/hid_boot.c
 
 $(BUILD_DIR)/tests/gfx_clip_test: tests/gfx_clip_test.c kernel/gfx/gfx_types.h
 	@mkdir -p $(@D)
-	g++ -std=c++17 -O2 -Wall -Wextra -Werror -fno-builtin $(KERNEL_INC) -o $@ $<
+	$(CXX) -std=c++17 -O2 -Wall -Wextra -Werror -fno-builtin $(KERNEL_INC) -o $@ $<
 
 $(BUILD_DIR)/tests/axdri_cmd_test: tests/axdri_cmd_test.c kernel/axdri_cmd.h ports/mesa-axiome/axdri.c ports/mesa-axiome/axdri.h
 	@mkdir -p $(@D)
@@ -351,12 +357,12 @@ test-hid: $(BUILD_DIR)/tests/hid_boot_test
 	$(BUILD_DIR)/tests/hid_boot_test
 
 debug: disk.img
-	qemu-system-x86_64 -bios /usr/share/ovmf/OVMF.fd \
+	qemu-system-x86_64 -bios $(OVMF) \
 		-drive file=$(BUILD_DIR)/disk.img,format=raw,if=ide,index=0,media=disk \
 		-m 512M -serial stdio -display $(QEMU_DISPLAY) -device $(QEMU_GPU_DEVICE) -s -S
 
 install: disk.img
-	sudo $(shell pwd)/tools/install.sh $(DEV) $(BUILD_DIR)
+	$(SUDO) $(CURDIR)/tools/install.sh $(DEV) $(BUILD_DIR)
 
 clean:
 	rm -rf $(BUILD_DIR)/isodir $(BUILD_DIR)/isowork $(BUILD_DIR)/boot.fat \
