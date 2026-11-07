@@ -177,6 +177,16 @@ void *shm_attach(long id)
     return (void *)syscall(SYS_SHM_ATTACH, id, 0, 0, 0, 0, 0);
 }
 
+void shm_destroy(long id)
+{
+    syscall(SYS_SHM_DESTROY, id, 0, 0, 0, 0, 0);
+}
+
+int fcntl(int fd, int cmd, int arg)
+{
+    return (int)syscall(SYS_FCNTL, fd, cmd, arg, 0, 0, 0);
+}
+
 int sock_create(int domain, int type, int proto)
 {
     return (int)syscall(SYS_SOCKET_CREATE, (long)domain, (long)type,

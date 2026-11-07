@@ -81,6 +81,8 @@ long ipc_recv(int chan, void *buf, size_t max);
 
 long shm_create(size_t bytes);
 void *shm_attach(long id);
+void shm_destroy(long id);
+int fcntl(int fd, int cmd, int arg);
 
 #define AF_INET  2
 #define SOCK_DGRAM  2

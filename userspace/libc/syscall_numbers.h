@@ -112,6 +112,19 @@
 #define SYS_REBOOT        71   /* sys_reboot(): 8042 reset pulse           */
 #define SYS_POWEROFF      72   /* sys_poweroff(): ACPI S5 via PM1a_CNT     */
 
-#define __SYS_LAST        73   /* one past the highest number */
+#define SYS_GFX_FLIP      73   /* sys_gfx_flip(resource_id): page-flip scanout */
+
+#define SYS_SHM_DESTROY   74   /* sys_shm_destroy(id): free a shared memory segment */
+
+#define SYS_FCNTL         75   /* sys_fcntl(fd, cmd, arg): file descriptor control */
+
+#define __SYS_LAST        76   /* one past the highest number */
+
+/* File descriptor flags (for fcntl F_GETFL / F_SETFL). */
+#define O_NONBLOCK        04000
+
+/* fcntl commands. */
+#define F_GETFL           3
+#define F_SETFL           4
 
 #endif

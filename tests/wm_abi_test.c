@@ -20,15 +20,16 @@ int main(void)
     CHECK(offsetof(struct wm_event, y) == 12);
     CHECK(WM_EV_KEY == 1u);
     CHECK(WM_EV_MOUSE == 2u);
-    CHECK(sizeof(struct wm_win_hdr) == 48u);
-    CHECK(WM_HDR_SIZE == 48u);
+    CHECK(sizeof(struct wm_win_hdr) == 56u);
+    CHECK(WM_HDR_SIZE == 56u);
     CHECK(offsetof(struct wm_win_hdr, gfx_caps) == 32u);
     CHECK(offsetof(struct wm_win_hdr, gfx_detail) == 40u);
+    CHECK(offsetof(struct wm_win_hdr, pitch) == 48u);
     CHECK(WM_MAGIC == 0x57494E44u);
-    /* Fixed geometry must fit one SHM_SLOT (2 MiB) with room for header. */
+    /* Fixed geometry must fit one SHM_SLOT (8 MiB) with room for header. */
     CHECK(WM_WIN_W == 620u && WM_WIN_H == 420u);
-    CHECK(WM_HDR_SIZE + (uint64_t)WM_WIN_W * WM_WIN_H * 4u < 0x200000ULL);
+    CHECK(WM_HDR_SIZE + (uint64_t)WM_SHM_MAX_W * WM_SHM_MAX_H * 4u < 0x800000ULL);
     CHECK(WM_MAX_WIN == 6u);
-    printf("PASS wm/abi (14 checks)\n");
+    printf("PASS wm/abi (15 checks)\n");
     return 0;
 }

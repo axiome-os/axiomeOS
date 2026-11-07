@@ -108,8 +108,8 @@ static int axclient_init(struct axclient *cx, int argc, char **argv,
     }
     /* axgui_win_attach already caps geometry; re-check explicitly so a
        corrupt header can never size our framebuffer. */
-    if (cx->hdr->w == 0 || cx->hdr->h == 0 || cx->hdr->w > WM_WIN_W ||
-        cx->hdr->h > WM_WIN_H)
+    if (cx->hdr->w == 0 || cx->hdr->h == 0 || cx->hdr->w > WM_SHM_MAX_W ||
+        cx->hdr->h > WM_SHM_MAX_H)
     {
         printf("%s: bad window geometry\n", prog);
         return -1;
@@ -163,6 +163,80 @@ static inline const char *axclient_detail_mode(struct axclient *cx)
 static int axclient_closed(struct axclient *cx)
 {
     return cx->hdr->closed != 0;
+}
+
+/* Non-blocking drain of pending wm_events; returns count. On WM_EV_RESIZE,
+   updates cx->fb.w/h so subsequent draws match the new window size. The
+   caller must still call axclient_begin/commit around its redraw. */
+static int axclient_poll_events(struct axclient *cx)
+{
+    if (!cx || cx->evfd < 0)
+        return 0;
+    /* Temporarily set O_NONBLOCK so we can drain pending events without
+       blocking. Restore the original flags before returning so blocking
+       readers (axgui_wm_recv in axmui_app_run) are unaffected. */
+    int old_flags = fcntl(cx->evfd, F_GETFL, 0);
+    fcntl(cx->evfd, F_SETFL, old_flags | O_NONBLOCK);
+    int got = 0;
+    for (;;)
+    {
+        struct wm_event ev;
+        long r = read(cx->evfd, &ev, sizeof(ev));
+        if (r <= 0)
+            break;
+        got++;
+        if (ev.type == WM_EV_RESIZE)
+        {
+            if (ev.code != 0)
+            {
+                /* Compositor reallocated the SHM segment: reattach to the new
+                   buffer so the client draws at the new size without
+                   pitch mismatch or diagonal smearing. */
+                uint8_t *new_base = (uint8_t *)shm_attach((long)ev.code);
+                if (new_base)
+                {
+                    struct wm_win_hdr *new_hdr =
+                        (struct wm_win_hdr *)new_base;
+                    if (new_hdr->magic == WM_MAGIC)
+                    {
+                        shm_destroy(cx->shmid);
+                        cx->shmid = (long)ev.code;
+                        cx->hdr = new_hdr;
+                        cx->fb.w = new_hdr->w;
+                        cx->fb.h = new_hdr->h;
+                        cx->fb.pitch = new_hdr->pitch;
+                        cx->fb.size =
+                            (uint64_t)new_hdr->w * new_hdr->h * 4;
+                        cx->fb.px =
+                            (uint32_t *)(new_base + WM_HDR_SIZE);
+                        cx->fb.fd = -1;
+                        cx->fb.handle = 0;
+                    }
+                }
+            }
+            else
+            {
+                /* Live resize: same SHM buffer, just new logical dimensions.
+                   The buffer is allocated at WM_SHM_MAX_W x WM_SHM_MAX_H so
+                   any size up to that fits; update fb.w/h so the client
+                   repaints at the new size without reallocating. */
+                cx->fb.w = (uint32_t)ev.x;
+                cx->fb.h = (uint32_t)ev.y;
+                cx->fb.size =
+                    (uint64_t)cx->fb.w * cx->fb.h * 4;
+            }
+        }
+        else if (ev.type == WM_EV_KEY)
+        {
+            /* handled by the client's own loop */
+        }
+        else if (ev.type == WM_EV_MOUSE)
+        {
+            /* handled by the client's own loop */
+        }
+    }
+    fcntl(cx->evfd, F_SETFL, old_flags);
+    return got;
 }
 
 /* Slot was reused under us (only meaningful with <gen> on argv): exit at

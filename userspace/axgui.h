@@ -162,6 +162,14 @@ static int axgui_present(struct axgui_fb *fb)
 
 /* Present only a rectangle (same src/dst rect) of the dumb buffer. Keeps a
    pointer-only cursor move off the full-screen blit path (see guixd.c). */
+/* Page-flip: make `resource_id` the new scanout without a CPU blit.
+   Returns 0 on success, -1 when the backend cannot flip. */
+static int axgui_flip(uint32_t resource_id)
+{
+    long r = syscall(SYS_GFX_FLIP, (long)resource_id, 0, 0, 0, 0, 0);
+    return (r == 0) ? 0 : -1;
+}
+
 static int axgui_present_rect(struct axgui_fb *fb, int x, int y, int w, int h)
 {
     struct axgui_cmd p;
@@ -643,12 +651,12 @@ static struct wm_win_hdr *axgui_win_attach(long shmid, struct axgui_fb *fb)
         return 0;
     hdr = (struct wm_win_hdr *)base;
     if (hdr->magic != WM_MAGIC || hdr->w == 0 || hdr->h == 0 ||
-        hdr->w > WM_WIN_W || hdr->h > WM_WIN_H)
+        hdr->w > WM_SHM_MAX_W || hdr->h > WM_SHM_MAX_H)
         return 0;
     fb->fd = -1;
     fb->w = hdr->w;
     fb->h = hdr->h;
-    fb->pitch = hdr->w * 4;
+    fb->pitch = hdr->pitch; /* physical row stride of the SHM buffer */
     fb->handle = 0;
     fb->size = (uint64_t)hdr->w * hdr->h * 4;
     fb->px = (uint32_t *)(base + WM_HDR_SIZE);

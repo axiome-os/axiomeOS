@@ -966,8 +966,33 @@ static int run_wm_client(struct axclient *cx, char **cargv, int cargc,
     cx->hdr->ready = 1;
     axclient_commit(cx);
 
+    /* Make shell pipes non-blocking so we can drain compositor events
+       (especially WM_EV_RESIZE during drag) without stalling. */
+    fcntl(sh.from_shell, F_SETFL, O_NONBLOCK);
+
     for (;;)
     {
+        /* drain compositor events (incl. WM_EV_RESIZE) so a window resize
+           repaints the terminal buffer even when the shell is silent */
+        int resize_pending = axclient_poll_events(cx);
+        if (resize_pending > 0)
+        {
+            /* Sync compositor-updated FB dims into axmui's copy. */
+            win->fb.w = cx->fb.w;
+            win->fb.h = cx->fb.h;
+            int cols = (cx->fb.w - 16) / FONT_WIDTH;
+            int rows = (cx->fb.h - 16) / FONT_HEIGHT;
+            if (cols < 8) cols = 8;
+            if (rows < 4) rows = 4;
+            if (cols != term.cols || rows != term.rows)
+            {
+                term_init(&term, cols, rows);
+                termView->style.flex_grow = 1;
+            }
+            axclient_begin(cx);
+            axmui_window_render(win);
+            axclient_commit(cx);
+        }
         long n = read(sh.from_shell, out, sizeof(out));
         if (n > 0)
         {
@@ -982,8 +1007,8 @@ static int run_wm_client(struct axclient *cx, char **cargv, int cargc,
         }
         else
         {
-            out_eof = 1;
-            closing = 1;
+            /* EAGAIN or error: no shell output right now, not EOF. */
+            errno = 0;
         }
         if (axclient_closed(cx) || axclient_stale(cx))
             closing = 1;
@@ -1040,6 +1065,7 @@ static int run_wm_client(struct axclient *cx, char **cargv, int cargc,
             }
             axgui_msleep(10);
         }
+        sys_yield();
     }
 
     axclient_begin(cx);

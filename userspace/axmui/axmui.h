@@ -1739,6 +1739,48 @@ static int axmui_app_run(axmui_app_t *app, int argc, char **argv, const char *pr
                     /* let handler decide to close */
                 }
             }
+        } else if(ev.type==WM_EV_RESIZE){
+            /* compositor resized the window: if code != 0, the SHM segment
+               was reallocated — reattach to the new buffer. If code == 0,
+               it's a live resize: same buffer, new logical dims only. */
+            if (ev.code != 0)
+            {
+                uint8_t *new_base = (uint8_t *)shm_attach((long)ev.code);
+                if (new_base)
+                {
+                    struct wm_win_hdr *new_hdr =
+                        (struct wm_win_hdr *)new_base;
+                    if (new_hdr->magic == WM_MAGIC)
+                    {
+                        shm_destroy(cx.shmid);
+                        cx.shmid = (long)ev.code;
+                        cx.hdr = new_hdr;
+                        cx.fb.w = new_hdr->w;
+                        cx.fb.h = new_hdr->h;
+                        cx.fb.pitch = new_hdr->pitch;
+                        cx.fb.size =
+                            (uint64_t)new_hdr->w * new_hdr->h * 4;
+                        cx.fb.px =
+                            (uint32_t *)(new_base + WM_HDR_SIZE);
+                        cx.fb.fd = -1;
+                        cx.fb.handle = 0;
+                        win->fb = cx.fb;
+                    }
+                }
+            }
+            else
+            {
+                /* Live resize: same SHM buffer, just new logical dimensions.
+                   Buffer pitch stays fixed at hdr->pitch (WM_SHM_MAX_W * 4). */
+                cx.fb.w = (uint32_t)ev.x;
+                cx.fb.h = (uint32_t)ev.y;
+                win->fb.w = (uint32_t)ev.x;
+                win->fb.h = (uint32_t)ev.y;
+            }
+            win->root->w = (int)ev.x;
+            win->root->h = (int)ev.y;
+            win->needs_layout = 1;
+            win->needs_render = 1;
         }
         /* re-render if dirty */
         axclient_begin(&cx);
