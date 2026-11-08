@@ -1,40 +1,32 @@
-/* axlogin — GUI login (axiomeOS /Binaries/axlogin)
- * Rebuilt on axmui: native HTML+CSS toolkit.
- * Shows username/password form. On success authenticates, records session
- * in /var/run/axlogin.<shmid> and exits 0 so guixd can spawn the user session.
- */
-#include "axclient.h"
-#include "axmui/axmui.h"
+/* axlogin — GUI login (axiomeOS /Binaries/axlogin).
+ * Rebuilt on axw + axmui: native HTML+CSS login form.
+ * Shows username/password form. On success authenticates and exits 0 so the
+ * display server can start the user session. On failure shows an error.
+ * The legacy session-file hand-off to guixd is gone (guixd removed); the
+ * display server (axdisplay-server) owns the session now. */
+#include "axw-protocol.h"
+#include "axw-client.h"
+#include "axgui.h"
+#include "wm_abi.h"
 #include "axsha256.h"
+#include "axmui/axmui.h"
+#include "syscall.h"
+#include "stdio.h"
+#include "string.h"
+#include "stdlib.h"
+#include <stddef.h>
+#include <stdint.h>
 
-#define BTN_LOGIN 1
 #define AXLOGIN_RUN_DIR "/var/run"
 
 static axmui_app_t *g_app;
 static axmui_window_t *g_win;
-static struct axclient *g_cxptr;
+static int g_login_ok = 0;
 
 static void login_scrub(axmui_view_t *v){
     if(!v) return;
     memset(v->value,0,sizeof(v->value));
     memset(v->text,0,sizeof(v->text));
-}
-
-static int write_session_file(long shmid, uid_t uid, gid_t gid){
-    char path[64]; char body[64]; int fd; size_t off=0, len;
-    if(shmid<=0) return -1;
-    mkdir(AXLOGIN_RUN_DIR);
-    snprintf(path,sizeof(path),"%s/axlogin.%ld",AXLOGIN_RUN_DIR,shmid);
-    snprintf(body,sizeof(body),"%u %u\n",(unsigned)uid,(unsigned)gid);
-    len=strlen(body);
-    fd=open(path, O_WRONLY|O_CREAT|O_TRUNC);
-    if(fd<0) return -1;
-    while(off<len){
-        long r=write(fd, body+off, len-off);
-        if(r<=0){ close(fd); return -1; }
-        off+=(size_t)r;
-    }
-    close(fd); return 0;
 }
 
 static void set_status(const char *s){
@@ -60,48 +52,66 @@ static int do_login(void){
         return 0;
     }
     memset(pass,0,sizeof(pass));
-    login_scrub(pview);
-    uid_t uid; gid_t gid;
-    if(sys_getpwnam(user, &uid, &gid)<0){
-        set_status("Login failed.");
-        return 0;
-    }
     set_status("");
-    if(!g_cxptr){ set_status("No window context."); return 0; }
-    if(write_session_file(g_cxptr->shmid, uid, gid)<0){
-        set_status("Could not record the session.");
-        return 0;
-    }
+    g_login_ok = 1;
+    if(g_app) g_app->running=0;
     return 1;
 }
 
-static void on_login_click(axmui_view_t *v, void *ud){
-    (void)v; (void)ud;
-    if(do_login()){
-        if(g_app) g_app->running=0;
-        /* exit code 0 handled by main return */
-        g_app->running=0;
-        /* use global flag to signal success - main loop will exit and we return 0 */
-        /* we need to propagate success via a static variable */
+/* True when /etc/passwd holds a "user" or "admin" account. */
+static int has_regular_user(void){
+    char text[8193];
+    int fd=open("/etc/passwd",O_RDONLY);
+    size_t got=0;
+    long r;
+    if(fd<0) return 0;
+    while(got+1<sizeof(text)){
+        r=read(fd,text+got,sizeof(text)-1-got);
+        if(r<=0) break;
+        got+=(size_t)r;
     }
+    close(fd);
+    text[got]=0;
+    char *line=text;
+    while(*line){
+        char *nl=line;
+        char *f[7];
+        int nf=0;
+        char *p=line;
+        while(*nl && *nl!='\n') nl++;
+        if(*nl)*nl++=0;
+        while(*p && nf<7){
+            f[nf++]=p;
+            while(*p && *p!=':') p++;
+            if(*p)*p++=0;
+        }
+        if(nf>=7 && f[4][0] &&
+            (strcmp(f[4],"user")==0 || strcmp(f[4],"admin")==0))
+            return 1;
+        line=nl;
+    }
+    return 0;
 }
 
-static int g_login_ok=0;
-static void on_login_click_ok(axmui_view_t *v, void *ud){
-    (void)v; (void)ud;
-    if(do_login()){
-        g_login_ok=1;
-        if(g_app) g_app->running=0;
-    }
+static void on_login_click(axmui_view_t *v, void *ud){
+    (void)v;(void)ud;
+    do_login();
+}
+
+static void on_login_key(axmui_view_t *sender, void *ud){
+    (void)sender;(void)ud;
+    if(g_app) g_app->running=0;
 }
 
 int main(int argc, char **argv){
+    (void)argc;(void)argv;
+
     g_app=axmui_app_create();
     if(!g_app) return 1;
     g_win=axmui_window_create(g_app,"Login", WM_WIN_W, WM_WIN_H);
     if(!g_win) return 1;
 
-    int nouser=!axclient_has_regular_user();
+    int nologin=!has_regular_user();
 
     const char *html =
         "<div class='col'>"
@@ -126,91 +136,23 @@ int main(int argc, char **argv){
 
     axmui_window_set_html(g_win, html, css);
 
-    /* secure password field */
     axmui_view_t *pass=axmui_view_find(axmui_window_root(g_win),"pass");
     if(pass) pass->input_secure=1;
 
     axmui_view_t *loginBtn=axmui_view_find(axmui_window_root(g_win),"login");
-    if(loginBtn) axmui_view_on_click(loginBtn, on_login_click_ok, NULL);
+    if(loginBtn) axmui_view_on_click(loginBtn, on_login_click, NULL);
 
-    /* status for no-user */
-    if(nouser) set_status("No user account exists yet: run First-boot setup first.");
-
-    /* wire Enter on inputs to login */
+    /* Enter in an input fires on_change -> do_login (wired below). */
     axmui_view_t *user=axmui_view_find(axmui_window_root(g_win),"user");
     axmui_view_t *pv=axmui_view_find(axmui_window_root(g_win),"pass");
-    if(user)  user->on_change=on_login_click_ok;
-    if(pv)    pv->on_change=on_login_click_ok;
+    if(user){ user->on_change=do_login; g_win->focused=user; user->focused=1; }
+    if(pv) pv->on_change=do_login;
 
-    /* focus first field */
-    g_win->focused=user;
-    if(user) user->focused=1;
+    if(nologin) set_status("No user account exists yet: run First-boot setup first.");
 
-    /* Need cx ptr for session file: after axmui_app_run attaches we can get it.
-       Workaround: parse args ourselves to get shmid before run, store for write. */
-    /* Pre-parse shmid */
-    long shmid=-1;
-    if(argc>=6 && strcmp(argv[1],"--wm")==0){
-        axclient_parse_num(argv[2], &shmid);
-    }
-    /* create a fake client for session path before running - attach will overwrite */
-    /* Instead we will capture it inside app run via g_win->cx after attach. To do that we need to intercept.
-       Easiest: run custom loop that captures shmid via axclient_init ourselves, then enter axmui render loop.
-       But we use axmui_app_run which does its own init and we lose shmid reference.
-       So we store shmid globally and write_session_file will use that if g_cxptr null.
-    */
-    static long g_shmid;
-    g_shmid=shmid;
+    /* Escape (or any key when not in an input) quits without logging in. */
+    axmui_window_on_key(g_win, on_login_key, NULL);
 
-    /* Custom handler that needs correct shmid: override write_session_file to use g_shmid if needed */
-    /* Patch do_login to fallback */
-    /* We'll do it by setting global before run and inside do_login check */
-    /* To make g_cxptr available, we will run a tiny wrapper: instead of axmui_app_run, we do manual attach+loop so we can capture cx */
-
-    /* Manual attach+loop to keep g_cxptr valid for session file */
-    struct axclient cx;
-    int rest=axclient_init(&cx, argc, argv, "axlogin");
-    if(rest<0) return 1;
-    g_cxptr=&cx;
-    /* axclient_init already attached via axgui_win_attach; render initial frame */
-    axclient_begin(&cx);
-    axmui_window_render(g_win);
-    cx.hdr->ready=1;
-    axclient_commit(&cx);
-
-    uint32_t prev_btn=0;
-    while(g_app->running){
-        struct wm_event ev;
-        if(axclient_closed(&cx)||axclient_stale(&cx)) break;
-        if(axgui_wm_recv(cx.evfd,&ev)<0) break;
-        if(axclient_closed(&cx)||axclient_stale(&cx)) break;
-        if(ev.type==WM_EV_MOUSE){
-            axmui_handle_mouse(g_win, ev.x, ev.y, ev.code, &prev_btn);
-        } else if(ev.type==WM_EV_KEY){
-            if(ev.code=='\t'||ev.code==AXINPUT_KEY_DOWN||ev.code==AXINPUT_KEY_UP){
-                int dir=(ev.code==AXINPUT_KEY_UP)?-1:1;
-                axmui_view_t *list[AXMUI_MAX_NODES]; int n=0;
-                for(int k=0;k<g_win->pool_used;k++){ axmui_view_t *nd=&g_win->pool[k]; if((axmui_str_case_eq(nd->tag,"input")||axmui_str_case_eq(nd->tag,"button")) && nd->style.display!=AXMUI_DISPLAY_NONE) list[n++]=nd; }
-                if(n>0){ int idx=-1; for(int k=0;k<n;k++) if(list[k]==g_win->focused) idx=k; int nxt=(idx+dir+n)%n; g_win->focused=list[nxt]; for(int k=0;k<g_win->pool_used;k++) g_win->pool[k].focused=0; list[nxt]->focused=1; }
-            } else {
-                axmui_view_t *f=g_win->focused;
-                if(f && axmui_str_case_eq(f->tag,"input")){
-                    if(ev.code==127||ev.code==8){ axmui_input_backspace(f); }
-                    else if(ev.code=='\n'||ev.code=='\r'){
-                        if(f->on_change) f->on_change(f,f->on_change_data);
-                        else if(do_login()){ g_login_ok=1; break; }
-                    } else if(ev.code>=32&&ev.code<127){ axmui_input_append(f,(char)ev.code); }
-                } else {
-                    if(ev.code=='\n'||ev.code=='\r'){
-                        if(f && axmui_str_case_eq(f->tag,"button")&&f->on_click){ f->on_click(f,f->on_click_data); }
-                    }
-                }
-            }
-        }
-        axclient_begin(&cx);
-        axmui_window_render(g_win);
-        axclient_commit(&cx);
-        if(g_login_ok) break;
-    }
-    return g_login_ok?0:0;
+    axmui_app_run(g_app, argc, argv, "axlogin");
+    return g_login_ok ? 0 : 1;
 }

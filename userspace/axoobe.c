@@ -1,9 +1,19 @@
-/* axoobe — GUI first-boot setup (axiomeOS /Binaries/axoobe)
- * Rebuilt on axmui: native HTML+CSS.
- */
-#include "axclient.h"
-#include "axmui/axmui.h"
+/* axoobe — GUI first-boot setup (axiomeOS /Binaries/axoobe).
+ * Rebuilt on axw + axmui: native HTML+CSS.
+ * Creates the first user account when /etc/passwd has no regular user yet.
+ * If an account already exists, shows a notice and waits for a key. */
+#include "axw-protocol.h"
+#include "axw-client.h"
+#include "axgui.h"
+#include "wm_abi.h"
 #include "axsha256.h"
+#include "axmui/axmui.h"
+#include "syscall.h"
+#include "stdio.h"
+#include "string.h"
+#include "stdlib.h"
+#include <stddef.h>
+#include <stdint.h>
 
 #define PASSWD_PATH "/etc/passwd"
 #define USERS_DIR   "/Users"
@@ -13,21 +23,59 @@ static axmui_window_t *g_win;
 static int g_admin=0;
 static int g_created=0;
 
+static void set_status(const char *s){
+    axmui_view_t *st=axmui_view_find(axmui_window_root(g_win),"status");
+    if(st && s) strncpy(st->text,s,sizeof(st->text)-1);
+}
+
+static void scrub_view(axmui_view_t *v){ if(v){ memset(v->value,0,sizeof(v->value)); memset(v->text,0,sizeof(v->text)); } }
+
 static int valid_username(const char *s){
     if(s[0]==0||strlen(s)>31) return 0;
     while(*s){ char c=*s++; if(!((c>='a'&&c<='z')||(c>='A'&&c<='Z')||(c>='0'&&c<='9')||c=='_'||c=='-'||c=='.')) return 0;}
     return 1;
 }
-static void set_status(const char *s){
-    axmui_view_t *st=axmui_view_find(axmui_window_root(g_win),"status");
-    if(st && s) strncpy(st->text,s,sizeof(st->text)-1);
+
+/* True when /etc/passwd holds a "user" or "admin" account. */
+static int has_regular_user(void){
+    char text[8193];
+    int fd=open(PASSWD_PATH,O_RDONLY);
+    size_t got=0;
+    long r;
+    if(fd<0) return 0;
+    while(got+1<sizeof(text)){
+        r=read(fd,text+got,sizeof(text)-1-got);
+        if(r<=0) break;
+        got+=(size_t)r;
+    }
+    close(fd);
+    text[got]=0;
+    char *line=text;
+    while(*line){
+        char *nl=line;
+        char *f[7];
+        int nf=0;
+        char *p=line;
+        while(*nl && *nl!='\n') nl++;
+        if(*nl)*nl++=0;
+        while(*p && nf<7){
+            f[nf++]=p;
+            while(*p && *p!=':') p++;
+            if(*p)*p++=0;
+        }
+        if(nf>=7 && f[4][0] &&
+            (strcmp(f[4],"user")==0 || strcmp(f[4],"admin")==0))
+            return 1;
+        line=nl;
+    }
+    return 0;
 }
+
 static int write_all(int fd,const char *buf,size_t len){
     size_t off=0;
     while(off<len){ long r=write(fd,buf+off,len-off); if(r<=0) return -1; off+=(size_t)r; }
     return 0;
 }
-static void scrub_view(axmui_view_t *v){ if(v){ memset(v->value,0,sizeof(v->value)); memset(v->text,0,sizeof(v->text)); } }
 
 static int create_account(void){
     axmui_view_t *uv=axmui_view_find(axmui_window_root(g_win),"user");
@@ -43,21 +91,22 @@ static int create_account(void){
     if(strlen(pass)<4){ memset(pass,0,sizeof(pass)); memset(confirm,0,sizeof(confirm)); set_status("Password must be at least 4 characters."); return 0; }
     if(strcmp(pass,confirm)!=0){ memset(pass,0,sizeof(pass)); memset(confirm,0,sizeof(confirm)); scrub_view(cv); set_status("Passwords do not match."); return 0; }
 
-    char dir[160]; char old[AXCLIENT_PASSWD_MAX+1]; char entry[256]; char hash[65]; size_t old_len=0;
+    char dir[160]; char old[4097]; char entry[256]; char hash[65]; size_t old_len=0;
     snprintf(dir,sizeof(dir),"%s/%s",USERS_DIR,name);
     if(mkdir(dir)!=0){
         struct stat st;
         if(stat(dir,&st)!=0 || !(st.st_mode & S_IFDIR)){ memset(pass,0,sizeof(pass)); memset(confirm,0,sizeof(confirm)); set_status("Could not create the home directory."); return 0; }
     }
     chown(dir,1000,1000);
-    if(axclient_read_whole(PASSWD_PATH, old,sizeof(old),&old_len)<0){ memset(pass,0,sizeof(pass)); memset(confirm,0,sizeof(confirm)); set_status("Could not read /etc/passwd."); return 0; }
-    if(axclient_has_regular_user()){ memset(pass,0,sizeof(pass)); memset(confirm,0,sizeof(confirm)); return 1; }
+    int fd=open(PASSWD_PATH,O_RDONLY);
+    if(fd>=0){ size_t got=0; long r; while(got+1<sizeof(old)){ r=read(fd,old+got,sizeof(old)-1-got); if(r<=0)break; got+=(size_t)r;} old[got]=0; old_len=got; close(fd); }
+    if(has_regular_user()){ memset(pass,0,sizeof(pass)); memset(confirm,0,sizeof(confirm)); return 1; }
     axsha256_hex(pass,hash);
     memset(pass,0,sizeof(pass)); memset(confirm,0,sizeof(confirm));
     scrub_view(pv); scrub_view(cv);
     int n=snprintf(entry,sizeof(entry),"%s:%s:1000:1000:%s:%s/%s:/bin/sh\n", name, hash, g_admin?"admin":"user", USERS_DIR, name);
     if(n<=0||(size_t)n>=sizeof(entry)){ set_status("Account entry too long."); return 0; }
-    int fd=open(PASSWD_PATH,O_WRONLY|O_APPEND);
+    fd=open(PASSWD_PATH,O_WRONLY|O_APPEND);
     if(fd<0){ set_status("Could not update /etc/passwd."); return 0; }
     if(old_len>0 && old[old_len-1]!='\n'){ if(write_all(fd,"\n",1)<0){ close(fd); set_status("Could not update /etc/passwd."); return 0; } }
     if(write_all(fd,entry,strlen(entry))<0){ close(fd); set_status("Could not update /etc/passwd."); return 0; }
@@ -70,18 +119,27 @@ static void on_create(axmui_view_t *v, void *ud){
     (void)v;(void)ud;
     if(create_account()){ set_status("Account created. Welcome to axiomeOS!"); g_created=1; if(g_app) g_app->running=0; }
 }
+
 static void on_admin_toggle(axmui_view_t *v, void *ud){
-    (void)v; (void)ud;
+    (void)v;(void)ud;
     axmui_view_t *cb=axmui_view_find(axmui_window_root(g_win),"admin");
     if(cb) g_admin=cb->checked;
 }
-static void on_any_key_nouser(axmui_view_t *v, void *ud){ (void)v;(void)ud; if(g_app) g_app->running=0; }
+
+static void on_close_key(axmui_view_t *sender, void *ud){
+    (void)sender;(void)ud;
+    if(g_app) g_app->running=0;
+}
 
 int main(int argc,char **argv){
-    if(axclient_has_regular_user()){
-        /* axmui still used for the notice */
-        g_app=axmui_app_create();
-        g_win=axmui_window_create(g_app,"First-boot setup",WM_WIN_W, WM_WIN_H);
+    (void)argc;(void)argv;
+
+    g_app=axmui_app_create();
+    if(!g_app) return 1;
+    g_win=axmui_window_create(g_app,"First-boot setup",WM_WIN_W,WM_WIN_H);
+    if(!g_win) return 1;
+
+    if(has_regular_user()){
         const char *html="<div class='col center' style='height:100%; gap:16px'>"
                          "<div class='card' style='text-align:center; align-items:center'>"
                          "<h1>First-boot setup</h1>"
@@ -91,23 +149,12 @@ int main(int argc,char **argv){
                          "</div></div>";
         axmui_window_set_html(g_win, html, "");
         axmui_view_t *closeBtn=axmui_view_find(axmui_window_root(g_win),"close");
-        if(closeBtn) axmui_view_on_click(closeBtn, on_any_key_nouser, NULL);
-        axmui_window_on_key(g_win, on_any_key_nouser, NULL);
-        struct axclient cx; int rest=axclient_init(&cx,argc,argv,"axoobe"); if(rest<0) return 0;
-        axclient_begin(&cx); axmui_window_render(g_win); cx.hdr->ready=1; axclient_commit(&cx);
-        uint32_t prev_btn2=0;
-        while(g_app->running){
-            struct wm_event ev; if(axclient_closed(&cx)||axclient_stale(&cx)) break; if(axgui_wm_recv(cx.evfd,&ev)<0) break;
-            if(ev.type==WM_EV_MOUSE){
-                axmui_handle_mouse(g_win, ev.x, ev.y, ev.code, &prev_btn2);
-            } else if(ev.type==WM_EV_KEY){ break; }
-            axclient_begin(&cx); axmui_window_render(g_win); axclient_commit(&cx);
-        }
+        if(closeBtn) axmui_view_on_click(closeBtn, on_close_key, NULL);
+        axmui_window_on_key(g_win, on_close_key, NULL);
+        axmui_app_run(g_app, argc, argv, "axoobe");
         return 0;
     }
 
-    g_app=axmui_app_create();
-    g_win=axmui_window_create(g_app,"First-boot setup",WM_WIN_W,WM_WIN_H);
     const char *html=
         "<div class='col'>"
         "  <div class='header'><h1>axiomeOS first-boot setup</h1></div>"
@@ -134,40 +181,15 @@ int main(int argc,char **argv){
     if(adminBtn) axmui_view_on_click(adminBtn, on_admin_toggle, NULL);
     if(createBtn) axmui_view_on_click(createBtn, on_create, NULL);
 
-    /* focus first input */
     axmui_view_t *user=axmui_view_find(axmui_window_root(g_win),"user");
     if(user){ g_win->focused=user; user->focused=1; }
 
-    /* custom loop that also handles Enter on inputs via on_change */
-    struct axclient cx; int rest=axclient_init(&cx,argc,argv,"axoobe"); if(rest<0) return 1;
-    axclient_begin(&cx); axmui_window_render(g_win); cx.hdr->ready=1; axclient_commit(&cx);
-    uint32_t prev_btn=0;
-    while(g_app->running){
-        struct wm_event ev;
-        if(axclient_closed(&cx)||axclient_stale(&cx)) break;
-        if(axgui_wm_recv(cx.evfd,&ev)<0) break;
-        if(axclient_closed(&cx)||axclient_stale(&cx)) break;
-        if(ev.type==WM_EV_MOUSE){
-            axmui_handle_mouse(g_win, ev.x, ev.y, ev.code, &prev_btn);
-        } else if(ev.type==WM_EV_KEY){
-            if(ev.code=='\t'||ev.code==AXINPUT_KEY_DOWN||ev.code==AXINPUT_KEY_UP){
-                int dir=(ev.code==AXINPUT_KEY_UP)?-1:1;
-                axmui_view_t *list[AXMUI_MAX_NODES]; int n=0;
-                for(int k=0;k<g_win->pool_used;k++){ axmui_view_t *nd=&g_win->pool[k]; if((axmui_str_case_eq(nd->tag,"input")||axmui_str_case_eq(nd->tag,"button"))&&nd->style.display!=AXMUI_DISPLAY_NONE) list[n++]=nd; }
-                if(n>0){ int idx=-1; for(int k=0;k<n;k++) if(list[k]==g_win->focused) idx=k; int nxt=(idx+dir+n)%n; g_win->focused=list[nxt]; for(int k=0;k<g_win->pool_used;k++) g_win->pool[k].focused=0; list[nxt]->focused=1; }
-            } else {
-                axmui_view_t *f=g_win->focused;
-                if(f && axmui_str_case_eq(f->tag,"input")){
-                    if(ev.code==127||ev.code==8) axmui_input_backspace(f);
-                    else if(ev.code=='\n'||ev.code=='\r'){ if(create_account()){ set_status("Account created."); axclient_begin(&cx); axmui_window_render(g_win); axclient_commit(&cx); return 0; } }
-                    else if(ev.code>=32&&ev.code<127) axmui_input_append(f,(char)ev.code);
-                } else {
-                    if(ev.code=='\n'||ev.code=='\r'){ if(f && axmui_str_case_eq(f->tag,"button")&&f->on_click) f->on_click(f,f->on_click_data); }
-                }
-            }
-        }
-        axclient_begin(&cx); axmui_window_render(g_win); axclient_commit(&cx);
-        if(g_created) return 0;
-    }
+    /* Enter on inputs / create button -> create account. */
+    axmui_view_t *pass=axmui_view_find(axmui_window_root(g_win),"pass");
+    if(user) user->on_change=create_account;
+    if(pass) pass->on_change=create_account;
+    if(cv) cv->on_change=create_account;
+
+    axmui_app_run(g_app, argc, argv, "axoobe");
     return g_created?0:1;
 }

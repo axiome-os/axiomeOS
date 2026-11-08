@@ -1,13 +1,10 @@
 /* axgui.h — shared header-only toolkit for axiomeOS GUI programs.
-   Included by axwm.c (mini window manager) and axterm.c (terminal).
-   Single source of truth where possible: input ABI + 8x16 font come from
-   kernel headers via relative includes; the DRI wire structs mirror
-   kernel/axdri_cmd.h exactly (same pattern as gfx_test.c, which cannot see
-   kernel headers under userspace -I rules).
-
-   Transport = Mesa winsys transport: /Devices/dri0 dumb buffers (CREATE +
-   SYS_MMAP + PRESENT). Software rasterization here is what Gallium softpipe
-   will drop into (see ports/mesa-axiome/WINSYS.md). */
+   Provides 2D software raster primitives (fill, rect, text, cursor,
+   alpha-blend, shadow, blur), input helpers (/Devices/input0 grab/poll),
+   and timing helpers. Clients draw directly into an SHM/axw buffer they
+   own and present it themselves (axw surface commit, or DRM page flip for
+   the scanout). No DRI dumb-buffer path here — that was removed with
+   kernel/dri.c. */
 
 #ifndef AXGUI_H
 #define AXGUI_H
@@ -22,23 +19,22 @@
 
 /* Single source of truth with the kernel (kernel/input_abi.h). */
 #include "input_abi.h"
-/* Compositor <-> client protocol (kernel/wm_abi.h). */
+/* Window geometry constants (WM_WIN_W/H, WM_SHM_*). wm_abi.h is kept for
+   these constants only; the seqlock runtime (axclient/compositor) is gone. */
 #include "wm_abi.h"
 /* 8x16 console font (kernel/font8x16.h). */
 #include "font8x16.h"
 
-/* ---- DRI wire protocol (mirrors kernel/axdri_cmd.h) ---- */
-#define AXGUI_DRI_MAGIC 0x41584452u
-#define AXGUI_DRI_CMD_SIZE 32
-#define AXGUI_MAP_HINT ((void *)0x200000000000ULL)
-
-enum {
-    AXGUI_GET_MODE = 0x01,
-    AXGUI_DUMB_CREATE = 0x02,
-    AXGUI_DUMB_MAP = 0x03,
-    AXGUI_DUMB_DESTROY = 0x04,
-    AXGUI_PRESENT = 0x05,
-    AXGUI_GET_CAPS = 0x06,
+/* ---- framebuffer / capability types (DRI dumb-buffer path removed;
+   clients now draw into SHM/axw buffers they own) ---- */
+struct axgui_fb {
+    int fd;
+    uint32_t w;
+    uint32_t h;
+    uint32_t pitch;
+    uint32_t handle;
+    uint64_t size;
+    uint32_t *px;
 };
 
 struct axgui_caps {
@@ -64,169 +60,6 @@ struct axgui_caps {
 #define AXGUI_CAP_GRADIENT   (1ull << 13)
 #define AXGUI_CAP_ROUNDED    (1ull << 14)
 
-struct axgui_mode {
-    uint32_t width;
-    uint32_t height;
-    uint32_t pitch;
-    uint32_t bpp;
-    uint32_t format;
-};
-
-struct axgui_cmd {
-    uint32_t magic;
-    uint32_t op;
-    uint32_t args[6];
-};
-
-struct axgui_fb {
-    int fd;
-    uint32_t w;
-    uint32_t h;
-    uint32_t pitch;
-    uint32_t handle;
-    uint64_t size;
-    uint32_t *px;
-};
-
-static int axgui_dri_open(struct axgui_fb *fb)
-{
-    struct axgui_mode m;
-    struct axgui_cmd c;
-    if (!fb)
-        return -1;
-    fb->fd = open("/Devices/dri0", 2);
-    if (fb->fd < 0)
-        return -1;
-    if (read(fb->fd, &m, sizeof(m)) != (long)sizeof(m) || m.width == 0)
-    {
-        close(fb->fd);
-        return -1;
-    }
-    fb->w = m.width;
-    fb->h = m.height;
-    c.magic = AXGUI_DRI_MAGIC;
-    c.op = AXGUI_DUMB_CREATE;
-    c.args[0] = m.width;
-    c.args[1] = m.height;
-    c.args[2] = 0;
-    c.args[3] = 0;
-    c.args[4] = 0;
-    c.args[5] = 0;
-    if (write(fb->fd, &c, sizeof(c)) != (long)sizeof(c) || c.args[3] == 0)
-    {
-        close(fb->fd);
-        return -1;
-    }
-    fb->pitch = c.args[2];
-    fb->handle = c.args[3];
-    fb->size = ((uint64_t)c.args[5] << 32) | c.args[4];
-    if (fb->pitch != m.width * 4 ||
-        fb->size != (uint64_t)m.width * m.height * 4)
-    {
-        close(fb->fd);
-        return -1;
-    }
-    {
-        uint64_t off = ((uint64_t)fb->handle << 32);
-        long mr = syscall(SYS_MMAP, (long)fb->fd, (long)off,
-                          (long)AXGUI_MAP_HINT, (long)fb->size, 0, 0);
-        if (mr != 0)
-        {
-            close(fb->fd);
-            return -1;
-        }
-    }
-    fb->px = (uint32_t *)AXGUI_MAP_HINT;
-    return 0;
-}
-
-static int axgui_present(struct axgui_fb *fb)
-{
-    struct axgui_cmd p;
-    uint32_t w, h;
-    if (!fb || fb->fd < 0)
-        return -1;
-    /* PRESENT packs geometry in 16 bits; clamp huge modes per call. */
-    w = fb->w > 0xFFFFu ? 0xFFFFu : fb->w;
-    h = fb->h > 0xFFFFu ? 0xFFFFu : fb->h;
-    p.magic = AXGUI_DRI_MAGIC;
-    p.op = AXGUI_PRESENT;
-    p.args[0] = fb->handle;
-    p.args[1] = 0;
-    p.args[2] = 0;
-    p.args[3] = (h << 16) | w;
-    p.args[4] = 0;
-    p.args[5] = 0;
-    return (write(fb->fd, &p, sizeof(p)) == (long)sizeof(p)) ? 0 : -1;
-}
-
-/* Present only a rectangle (same src/dst rect) of the dumb buffer. Keeps a
-   pointer-only cursor move off the full-screen blit path (see guixd.c). */
-/* Page-flip: make `resource_id` the new scanout without a CPU blit.
-   Returns 0 on success, -1 when the backend cannot flip. */
-static int axgui_flip(uint32_t resource_id)
-{
-    long r = syscall(SYS_GFX_FLIP, (long)resource_id, 0, 0, 0, 0, 0);
-    return (r == 0) ? 0 : -1;
-}
-
-static int axgui_present_rect(struct axgui_fb *fb, int x, int y, int w, int h)
-{
-    struct axgui_cmd p;
-    uint32_t ux, uy, uw, uh;
-    if (!fb || fb->fd < 0 || w <= 0 || h <= 0)
-        return -1;
-    if (x < 0) { w += x; x = 0; }
-    if (y < 0) { h += y; y = 0; }
-    if (w <= 0 || h <= 0)
-        return -1;
-    ux = (uint32_t)x;
-    uy = (uint32_t)y;
-    uw = (uint32_t)w;
-    uh = (uint32_t)h;
-    if (ux > fb->w || uy > fb->h)
-        return -1;
-    if (uw > fb->w - ux)
-        uw = fb->w - ux;
-    if (uh > fb->h - uy)
-        uh = fb->h - uy;
-    if (uw == 0 || uh == 0)
-        return -1;
-    if (uw > 0xFFFFu)
-        uw = 0xFFFFu;
-    if (uh > 0xFFFFu)
-        uh = 0xFFFFu;
-    p.magic = AXGUI_DRI_MAGIC;
-    p.op = AXGUI_PRESENT;
-    p.args[0] = fb->handle;
-    p.args[1] = (uy << 16) | ux;   /* source = same rect */
-    p.args[2] = (uy << 16) | ux;   /* dest   = same rect */
-    p.args[3] = (uh << 16) | uw;
-    p.args[4] = 0;
-    p.args[5] = 0;
-    return (write(fb->fd, &p, sizeof(p)) == (long)sizeof(p)) ? 0 : -1;
-}
-
-static int axgui_get_caps(struct axgui_fb *fb, struct axgui_caps *out)
-{
-    struct axgui_cmd c;
-    if (!fb || fb->fd < 0 || !out)
-        return -1;
-    /* Try read path first (freestanding axdri_caps) */
-    if (read(fb->fd, out, sizeof(*out)) == (long)sizeof(*out) && out->caps != 0)
-        return 0;
-    /* Fallback to ioctl-over-write */
-    c.magic = AXGUI_DRI_MAGIC;
-    c.op = AXGUI_GET_CAPS;
-    c.args[0] = 0; c.args[1] = 0; c.args[2] = 0; c.args[3] = 0; c.args[4] = 0; c.args[5] = 0;
-    if (write(fb->fd, &c, sizeof(c)) != (long)sizeof(c))
-        return -1;
-    out->caps = ((uint64_t)c.args[1] << 32) | c.args[0];
-    out->detail = c.args[2];
-    out->pad = 0;
-    return 0;
-}
-
 static inline int axgui_caps_has(struct axgui_caps *caps, uint64_t bit)
 {
     return caps && (caps->caps & bit);
@@ -236,24 +69,6 @@ static inline const char *axgui_detail_mode(struct axgui_caps *caps)
 {
     if (!caps) return "simplified";
     return caps->detail ? "detailed" : "simplified";
-}
-
-static void axgui_close(struct axgui_fb *fb)
-{
-    struct axgui_cmd k;
-    if (!fb || fb->fd < 0)
-        return;
-    k.magic = AXGUI_DRI_MAGIC;
-    k.op = AXGUI_DUMB_DESTROY;
-    k.args[0] = fb->handle;
-    k.args[1] = 0;
-    k.args[2] = 0;
-    k.args[3] = 0;
-    k.args[4] = 0;
-    k.args[5] = 0;
-    write(fb->fd, &k, sizeof(k));
-    close(fb->fd);
-    fb->fd = -1;
 }
 
 /* ---- input ---- */
@@ -634,70 +449,6 @@ static long axgui_run_wait(const char *cmd)
         return -1;
     sys_waitpid((int)pid, &status);
     return (long)status;
-}
-
-/* ---- compositor <-> client transport (wm_abi.h) ---- */
-
-/* Attach a window SHM segment and wire a draw-only framebuffer over its
-   pixels (fd stays -1: the compositor owns PRESENT). Returns the header. */
-static struct wm_win_hdr *axgui_win_attach(long shmid, struct axgui_fb *fb)
-{
-    uint8_t *base;
-    struct wm_win_hdr *hdr;
-    if (!fb || shmid <= 0)
-        return 0;
-    base = (uint8_t *)shm_attach(shmid);
-    if (!base)
-        return 0;
-    hdr = (struct wm_win_hdr *)base;
-    if (hdr->magic != WM_MAGIC || hdr->w == 0 || hdr->h == 0 ||
-        hdr->w > WM_SHM_MAX_W || hdr->h > WM_SHM_MAX_H)
-        return 0;
-    fb->fd = -1;
-    fb->w = hdr->w;
-    fb->h = hdr->h;
-    fb->pitch = hdr->pitch; /* physical row stride of the SHM buffer */
-    fb->handle = 0;
-    fb->size = (uint64_t)hdr->w * hdr->h * 4;
-    fb->px = (uint32_t *)(base + WM_HDR_SIZE);
-    return hdr;
-}
-
-/* Full-write one event (pipes are byte streams; short writes must loop). */
-static int axgui_wm_send(int fd, const struct wm_event *ev)
-{
-    size_t got = 0;
-    const uint8_t *p;
-    if (fd < 0 || !ev)
-        return -1;
-    p = (const uint8_t *)ev;
-    while (got < sizeof(*ev))
-    {
-        long r = write(fd, p + got, sizeof(*ev) - got);
-        if (r <= 0)
-            return -1;
-        got += (size_t)r;
-    }
-    return 0;
-}
-
-/* Blocking full-read of one event. Returns 0 on success, -1 on EOF/error
-   (the compositor closed the window). */
-static int axgui_wm_recv(int fd, struct wm_event *ev)
-{
-    size_t got = 0;
-    uint8_t *p;
-    if (fd < 0 || !ev)
-        return -1;
-    p = (uint8_t *)ev;
-    while (got < sizeof(*ev))
-    {
-        long r = read(fd, p + got, sizeof(*ev) - got);
-        if (r <= 0)
-            return -1;
-        got += (size_t)r;
-    }
-    return 0;
 }
 
 #endif

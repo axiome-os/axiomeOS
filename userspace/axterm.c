@@ -12,6 +12,7 @@
 #include "axw-protocol.h"
 #include "axw-client.h"
 #include "axgui.h"
+#include "wm_abi.h"
 #include "axmui/axmui.h"
 #include "errno.h"
 #include "signal.h"

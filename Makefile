@@ -63,8 +63,8 @@ bootloader:
 # Userspace build variables (defined before the target so prerequisites expand at parse time)
 USER_PROGS := init hello cat echo sh ls mkdir cp mv rm touch whoami uname \
 	login su chmod chown vfs_test ipc_test proc_test driver_test net_test \
-	kill kxtload kxtunload syslogd oobe date burn forkt ping gfx_test \
-	axwm axterm evtest axinfo guixd axlogin axoobe axdisplay-server
+	kill kxtload kxtunload syslogd oobe date burn forkt ping \
+	axterm evtest axinfo axlogin axoobe axdisplay-server
 USER_ELFS := $(addprefix userspace/,$(addsuffix .elf,$(USER_PROGS)))
 
 USER_BASE_CFLAGS := -ffreestanding -nostdlib -nostartfiles -fno-builtin \
@@ -278,7 +278,7 @@ LIBC_TESTS := \
 	$(BUILD_DIR)/tests/libc_time_test \
 	$(BUILD_DIR)/tests/libc_stdio_test
 
-TEST_BINS := $(KERNEL_TESTS) $(LIBC_TESTS) $(BUILD_DIR)/tests/gfx_clip_test $(BUILD_DIR)/tests/axdri_cmd_test $(BUILD_DIR)/tests/input_abi_test $(BUILD_DIR)/tests/wm_abi_test $(BUILD_DIR)/tests/virtio_gpu_test
+TEST_BINS := $(KERNEL_TESTS) $(LIBC_TESTS) $(BUILD_DIR)/tests/gfx_clip_test $(BUILD_DIR)/tests/input_abi_test $(BUILD_DIR)/tests/wm_abi_test $(BUILD_DIR)/tests/virtio_gpu_test
 
 .PHONY: test test-hid
 
@@ -293,10 +293,6 @@ $(BUILD_DIR)/tests/hid_boot_test: tests/hid_boot_test.c kernel/hid_boot.c
 $(BUILD_DIR)/tests/gfx_clip_test: tests/gfx_clip_test.c kernel/gfx/gfx_types.h
 	@mkdir -p $(@D)
 	$(CXX) -std=c++17 -O2 -Wall -Wextra -Werror -fno-builtin $(KERNEL_INC) -o $@ $<
-
-$(BUILD_DIR)/tests/axdri_cmd_test: tests/axdri_cmd_test.c kernel/axdri_cmd.h ports/mesa-axiome/axdri.c ports/mesa-axiome/axdri.h
-	@mkdir -p $(@D)
-	$(HOSTCC) $(TEST_CFLAGS) -DAXDRI_HOST_TEST -DAXDRI_KERNEL_HEADERS -I$(REPO_ROOT) $(KERNEL_INC) -o $@ $<
 
 $(BUILD_DIR)/tests/input_abi_test: tests/input_abi_test.c kernel/input_abi.h
 	@mkdir -p $(@D)

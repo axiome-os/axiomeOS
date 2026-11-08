@@ -62,8 +62,6 @@ Binaries/kxtload            0755  0  0  f  bin:userspace/kxtload.elf
 Binaries/kxtunload          0755  0  0  f  bin:userspace/kxtunload.elf
 Binaries/date               0755  0  0  f  bin:userspace/date.elf
 Binaries/ping               0755  0  0  f  bin:userspace/ping.elf
-Binaries/gfx_test           0755  0  0  f  bin:userspace/gfx_test.elf
-Binaries/axwm               0755  0  0  f  bin:userspace/axwm.elf
 Binaries/guixd               0755  0  0  f  bin:userspace/guixd.elf
 Binaries/axdisplay-server    0755  0  0  f  bin:userspace/axdisplay-server.elf
 Binaries/axterm             0755  0  0  f  bin:userspace/axterm.elf

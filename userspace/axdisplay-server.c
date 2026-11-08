@@ -886,12 +886,21 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    /* Map scanout buffer. */
+    /* Map scanout buffer via GEM_MMAP ioctl + mmap. */
     {
+        struct drm_gem_mmap mm;
+        mm.handle = scanout_handle;
+        mm.offset = 0;
+        mm.size = 0;
+        if (ioctl(drm_fd, DRM_IOCTL_GEM_MMAP, &mm) < 0)
+        {
+            printf("axdisplay: GEM_MMAP ioctl failed\n");
+            return 1;
+        }
         void *map_hint = (void *)0x200000000000ULL;
         long mr = syscall(SYS_MMAP, (long)drm_fd,
-                          (long)((uint64_t)scanout_handle << 32),
-                          (long)map_hint, (long)gem_size, 0, 0);
+                          (long)mm.offset,
+                          (long)map_hint, (long)mm.size, 0, 0);
         if (mr != 0)
         {
             printf("axdisplay: mmap failed\n");
