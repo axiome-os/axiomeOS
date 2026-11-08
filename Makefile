@@ -64,12 +64,13 @@ bootloader:
 USER_PROGS := init hello cat echo sh ls mkdir cp mv rm touch whoami uname \
 	login su chmod chown vfs_test ipc_test proc_test driver_test net_test \
 	kill kxtload kxtunload syslogd oobe date burn forkt ping gfx_test \
-	axwm axterm evtest axinfo guixd axlogin axoobe
+	axwm axterm evtest axinfo guixd axlogin axoobe axdisplay-server
 USER_ELFS := $(addprefix userspace/,$(addsuffix .elf,$(USER_PROGS)))
 
 USER_BASE_CFLAGS := -ffreestanding -nostdlib -nostartfiles -fno-builtin \
 	-fno-stack-protector -fPIC -mcmodel=small -O2 -g -pipe \
-	-mno-red-zone -Wall -Wextra -I userspace/libc -I$(REPO_ROOT)/kernel
+	-mno-red-zone -Wall -Wextra -I userspace -I userspace/libc -I userspace/libaxw \
+	-I$(REPO_ROOT)/kernel
 USER_CFLAGS := $(USER_BASE_CFLAGS) -fpie
 
 LIBC_CFLAGS := $(USER_BASE_CFLAGS)
@@ -83,6 +84,8 @@ LIBC_SRCS := userspace/libc/errno.c userspace/libc/string.c \
 LIBC_OBJS := $(patsubst userspace/libc/%.c, $(BUILD_DIR)/libc_%.o, $(LIBC_SRCS))
 LIBC_SL := userspace/libc.sl
 
+LIB_AXW_OBJ := $(BUILD_DIR)/libaxw_axw-client.o
+
 userspace: $(USER_ELFS) $(LIBC_SL)
 	@:
 
@@ -94,12 +97,16 @@ $(BUILD_DIR)/libc_%.o: userspace/libc/%.c
 	@mkdir -p $(@D)
 	$(CC) $(LIBC_CFLAGS) -c $< -o $@
 
+$(LIB_AXW_OBJ): userspace/libaxw/axw-client.c
+	@mkdir -p $(@D)
+	$(CC) $(USER_CFLAGS) -I userspace/libaxw -c $< -o $@
+
 $(LIBC_SL): $(LIBC_OBJS) userspace/libc.ld
 	@mkdir -p $(@D)
 	$(LD) -shared -T userspace/libc.ld --hash-style=sysv \
 		-soname libc.sl -z max-page-size=0x1000 -o $@ $(LIBC_OBJS)
 
-userspace/%.elf: $(BUILD_DIR)/%_user.o $(CRT0_OBJ) $(LIBC_SL)
+userspace/%.elf: $(BUILD_DIR)/%_user.o $(CRT0_OBJ) $(LIBC_SL) $(LIB_AXW_OBJ)
 	@mkdir -p $(@D)
 	$(LD) -pie -T userspace/link.ld --hash-style=sysv \
 		-z max-page-size=0x1000 -e _start -o $@ $^

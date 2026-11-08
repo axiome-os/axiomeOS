@@ -1,10 +1,7 @@
 /* axterm — terminal emulator for axiomeOS (/Binaries/axterm).
-   Two modes:
-   * standalone (no args): fullscreen /Devices/dri0 terminal, holds the GUI
-     input grab while a real /bin/sh session runs underneath.
-   * compositor client (`axterm --wm <shmid> <w> <h> <evfd> [--user <uid> <gid>]
-   *   [-c cmd...]`):
-     draws into the window SHM segment and reads wm_events from <evfd>.
+   Connects to /devices/axw0, creates an axw surface + shm buffer via axmui,
+   spawns /bin/sh, renders VT100 output directly into the surface buffer,
+   and commits to the compositor.
 
    axterm is only a terminal emulator: it spawns /bin/sh with pipes on
    stdin/stdout/stderr, forwards keystrokes to that shell, parses the shell's
@@ -12,24 +9,32 @@
    There is no command interpreter here; `exit`, `hello`, pipelines and shell
    builtins all belong to /bin/sh. */
 
-#include "axclient.h"
+#include "axw-protocol.h"
+#include "axw-client.h"
+#include "axgui.h"
 #include "axmui/axmui.h"
 #include "errno.h"
 #include "signal.h"
+#include "stdio.h"
+#include "string.h"
+#include "stdlib.h"
+#include "time.h"
+#include <stddef.h>
+#include <stdint.h>
 
 #define TERM_MAX_COLS 256
 #define TERM_MAX_ROWS 64
-#define TERM_CMD_MAX 512
 #define TERM_OUT_CHUNK 512
-#define AXTERM_MAX_FD 32 /* must match kernel MAX_FD in kernel/vfs.h */
+#define AXTERM_MAX_FD 32 /* must match kernel MAX_FD (kernel/vfs.h) */
+
+#define AXTERM_W WM_WIN_W
+#define AXTERM_H WM_WIN_H
 
 /* Palette (canonical 0x00RRGGBB). */
 #define C_BG      0x101418u
 #define C_BAR     0x1E2836u
 #define C_FG      0xD8DEE9u
-#define C_PROMPT  0x88C0D0u
 #define C_ACCENT  0x5E81ACu
-#define C_DIM     0x4C566Au
 
 struct term_state {
     int cols;
@@ -46,9 +51,14 @@ struct term_state {
 
 struct shell_session {
     long pid;
-    int to_shell;   /* parent/helper write end: shell stdin */
-    int from_shell; /* parent read end: shell stdout/stderr */
+    int to_shell;   /* write end: shell stdin */
+    int from_shell; /* read end: shell stdout/stderr */
 };
+
+/* Global terminal state (accessed by axw event handler). */
+static struct term_state g_term;
+
+/* ---- terminal core ---- */
 
 static void term_clamp_cursor(struct term_state *t)
 {
@@ -256,8 +266,6 @@ static void term_handle_csi(struct term_state *t, char final)
         term_erase_line(t, n);
         break;
     case 'm':
-        /* SGR attributes (colours/bold) are accepted and ignored: this
-           emulator keeps the fixed terminal palette. */
         break;
     case 's':
         t->saved_cx = t->cx;
@@ -306,7 +314,6 @@ static void term_feed(struct term_state *t, const char *buf, size_t len)
             }
             else if (b == '\a' || b == 0)
             {
-                /* bell and NUL: no visible effect */
             }
             else if (b == '\b')
             {
@@ -324,7 +331,6 @@ static void term_feed(struct term_state *t, const char *buf, size_t len)
             }
             else if (b == '\n')
             {
-                /* Match the kernel console: newline means CR+LF. */
                 t->cx = 0;
                 term_line_feed(t);
             }
@@ -338,7 +344,6 @@ static void term_feed(struct term_state *t, const char *buf, size_t len)
             }
             else if (b < 32 || b == 127)
             {
-                /* Other controls (including DEL) are not printable. */
             }
             else
             {
@@ -398,7 +403,6 @@ static void term_feed(struct term_state *t, const char *buf, size_t len)
             }
             else
             {
-                /* Unknown single-character escape: drop it. */
                 t->esc = 0;
             }
         }
@@ -432,7 +436,6 @@ static void term_feed(struct term_state *t, const char *buf, size_t len)
             else if (b == '?' || b == ' ' || b == '"' || b == '\'' ||
                      b == '$')
             {
-                /* Private/intermediate bytes: accepted, no behaviour. */
             }
             else if (b >= '@' && b <= '~')
             {
@@ -441,7 +444,6 @@ static void term_feed(struct term_state *t, const char *buf, size_t len)
             }
             else
             {
-                /* Malformed sequence: drop it rather than wedging. */
                 t->esc = 0;
             }
         }
@@ -498,9 +500,7 @@ static void term_draw(struct axgui_fb *fb, struct term_state *t, int x0,
     }
 }
 
-/* Translate one compositor key code into terminal input bytes. Keys the
-   shell cannot use (menu/scroll function keys) produce no bytes instead of
-   injecting garbage into the shell's stdin. */
+/* Translate one compositor key code into terminal input bytes. */
 static int term_key_bytes(uint32_t code, char *out)
 {
     if (!out)
@@ -563,35 +563,7 @@ static int term_key_bytes(uint32_t code, char *out)
     return 0;
 }
 
-/* Join argv[0..n) with spaces (for the window client's -c command). */
-static void join_args(char **argv, int n, char *out, size_t cap)
-{
-    size_t pos = 0;
-    int i;
-    out[0] = 0;
-    for (i = 0; i < n; i++)
-    {
-        const char *a = argv[i];
-        if (i > 0 && pos + 1 < cap)
-            out[pos++] = ' ';
-        while (*a && pos + 1 < cap)
-            out[pos++] = *a++;
-    }
-    out[pos] = 0;
-}
-
-static void close_extra_fds(int keep_a, int keep_b, int keep_c, int keep_d)
-{
-    int fd;
-    for (fd = 0; fd < AXTERM_MAX_FD; fd++)
-    {
-        if (fd == 0 || fd == 1 || fd == 2)
-            continue;
-        if (fd == keep_a || fd == keep_b || fd == keep_c || fd == keep_d)
-            continue;
-        close(fd);
-    }
-}
+/* ---- helper utilities ---- */
 
 static int write_all(int fd, const char *buf, size_t len)
 {
@@ -620,16 +592,20 @@ static int write_all(int fd, const char *buf, size_t len)
     return 0;
 }
 
-/* SIGKILL the process tree rooted at `root` (children before parents).
-   Used only for terminal teardown: a closed window must not leave its shell
-   or that shell's jobs behind. Never targets the caller itself.
+static void close_extra_fds(int keep_a, int keep_b, int keep_c, int keep_d)
+{
+    int fd;
+    for (fd = 0; fd < AXTERM_MAX_FD; fd++)
+    {
+        if (fd == 0 || fd == 1 || fd == 2)
+            continue;
+        if (fd == keep_a || fd == keep_b || fd == keep_c || fd == keep_d)
+            continue;
+        close(fd);
+    }
+}
 
-   Two hard rules make this deterministic instead of "rng":
-   * the root must be present in the CURRENT sys_ps snapshot, otherwise we
-     kill nothing: a bare kill-by-pid after the root already exited could
-     hit an unrelated recycled pid.
-   * kills go children-first (depth order, root last) so no child is
-     orphaned mid-pass; up to 3 snapshot passes catch late forks. */
+/* SIGKILL the process tree rooted at `root` (children before parents). */
 static void kill_process_tree(long root)
 {
     struct proc_info ps[64];
@@ -650,8 +626,6 @@ static void kill_process_tree(long root)
         n = sys_ps(ps, 64);
         if (n <= 0)
         {
-            /* Table unreadable: fall back to the root alone rather than
-               leaving the whole tree behind. */
             kill((int)root, SIGKILL);
             return;
         }
@@ -722,7 +696,7 @@ static void kill_process_tree(long root)
             if (!marked[i])
                 continue;
             if (depth[i] < 0)
-                depth[i] = 1000; /* detached chain: kill first */
+                depth[i] = 1000;
             if (depth[i] > maxd && depth[i] < 1000)
                 maxd = depth[i];
         }
@@ -739,12 +713,10 @@ static void kill_process_tree(long root)
             }
         }
         kill((int)root, SIGKILL);
-        /* Next pass re-snapshots and stops as soon as the root is gone. */
     }
 }
 
-/* Blocking wait with a deadline, so teardown never hangs forever if a child
-   is already gone or refuses to die promptly. Returns 0 when reaped. */
+/* Blocking wait with a deadline. */
 static int reap_child_deadline(long pid, int *status, int timeout_ms)
 {
     int waited = 0;
@@ -763,7 +735,7 @@ static int reap_child_deadline(long pid, int *status, int timeout_ms)
             return 0;
         }
         if (q < 0 && errno == ECHILD)
-            return 0; /* already gone (or never ours): counts as reaped */
+            return 0;
         if (waited >= timeout_ms)
             return -1;
         axgui_msleep(10);
@@ -771,7 +743,7 @@ static int reap_child_deadline(long pid, int *status, int timeout_ms)
     }
 }
 
-static int shell_spawn(struct shell_session *s, int uid, int gid, int evfd)
+static int shell_spawn(struct shell_session *s, int uid, int gid)
 {
     int to_shell[2] = { -1, -1 };
     int from_shell[2] = { -1, -1 };
@@ -810,16 +782,8 @@ static int shell_spawn(struct shell_session *s, int uid, int gid, int evfd)
             sys_exit(127);
         if (dup2(from_shell[1], 2) < 0)
             sys_exit(127);
-        /* The shell must not retain the compositor event pipe (or any
-           other inherited descriptor): a leaked read alias would defeat
-           the window's EOF delivery, a leaked write alias the shell's. */
-        if (evfd > 2)
-            close(evfd);
         for (fd = 3; fd < AXTERM_MAX_FD; fd++)
             close(fd);
-        /* Drop to the session user (axlogin passes --user after a successful
-           login). Refuse to continue if the drop fails: never run a user
-           session with the wrong credentials. */
         if (uid >= 0)
         {
             if (setgid((gid_t)gid) < 0 || setuid((uid_t)uid) < 0)
@@ -835,7 +799,6 @@ static int shell_spawn(struct shell_session *s, int uid, int gid, int evfd)
         write(2, "axterm: cannot exec /bin/sh\n", 28);
         sys_exit(127);
     }
-    /* Parent keeps the terminal side of both pipes. */
     close(to_shell[0]);
     close(from_shell[1]);
     s->pid = pid;
@@ -844,186 +807,199 @@ static int shell_spawn(struct shell_session *s, int uid, int gid, int evfd)
     return 0;
 }
 
-/* ---- compositor client mode (`axterm --wm ...`) — axmui edition ----
- * Still spawns /bin/sh with the same pipe discipline (helper for input,
- * supervisor for rendering) but the supervisor now renders through axmui:
- * HTML describes the chrome (header + card + terminal container), CSS styles
- * it, and the terminal grid itself is a custom-draw view inside that layout.
- * No WebKit — every pixel is native software raster.
- */
-static struct term_state *g_term_for_draw;
+/* ---- axw compositor client mode using axmui for surface lifecycle ---- */
 
-static void axmui_term_draw(struct axgui_fb *fb, axmui_view_t *view, void *ud){
-    struct term_state *t=(struct term_state*)ud;
-    if(!t||!fb||!view) return;
-    int x0=view->abs_x + view->style.border_w + view->style.padding[3];
-    int y0=view->abs_y + view->style.border_w + view->style.padding[0];
-    term_draw(fb,t,x0,y0);
-}
+static int g_axw_fd = -1;
+static struct axw_display *g_disp = 0;
+static struct axw_compositor *g_comp = 0;
+static struct axw_shm *g_shm = 0;
+static struct axw_surface *g_surf = 0;
+static struct axw_buffer *g_buf = 0;
+static long g_shmid = -1;
+static uint32_t g_surf_id = 0;
+static uint8_t *g_buf_map = 0;
+static struct axgui_fb g_fb;
 
-/* Keyboard pump: the only reader of the compositor event pipe. Forwards
-   keystrokes to the shell, then tears the shell session down when the
-   compositor closes the window (evfd EOF). */
-static void window_keyboard_pump(int evfd, int shell_in, long shell_pid)
+static int g_running = 1;
+static int g_shell_in = -1;
+static long g_shell_pid = -1;
+static int g_shell_gone = 0;
+static int g_shell_status = 1;
+static int g_out_eof = 0;
+static int g_need_render = 1;
+
+static int axterm_axw_event_handler(struct axw_display *d,
+                                    uint32_t sender_id,
+                                    uint16_t opcode,
+                                    const uint32_t *args, int nargs)
 {
-    struct wm_event ev;
-    for (;;)
+    (void)d;
+    /* Only process events addressed to our own surface. */
+    if (!g_surf || sender_id != g_surf_id)
+        return 0;
+
+    if (opcode == AXW_KEYBOARD_KEY)
     {
+        if (nargs < 2)
+            return 0;
+        uint32_t kc = args[1];
         char seq[4];
-        int n;
-        if (axgui_wm_recv(evfd, &ev) < 0)
-            break;
-        if (ev.type != WM_EV_KEY)
-            continue;
-        n = term_key_bytes(ev.code, seq);
-        if (n > 0 && write_all(shell_in, seq, (size_t)n) < 0)
-            break;
+        int n = term_key_bytes(kc, seq);
+        if (n > 0 && g_shell_in >= 0)
+            write_all(g_shell_in, seq, (size_t)n);
+        return 0;
     }
-    kill_process_tree(shell_pid);
-    close(shell_in);
-    close(evfd);
+    if (opcode == AXW_POINTER_BUTTON || opcode == AXW_POINTER_MOTION)
+    {
+        /* Terminal doesn't use mouse input. */
+        return 0;
+    }
+    return 0;
 }
 
-static int run_wm_client(struct axclient *cx, char **cargv, int cargc,
-                         int uid, int gid)
+static void axterm_render_frame(void)
+{
+    axgui_fill(&g_fb, 0, 0, (int)g_fb.w, (int)g_fb.h, C_BG);
+    axgui_fill(&g_fb, 0, 0, (int)g_fb.w, 24, C_BAR);
+    axgui_text(&g_fb, "axterm - /bin/sh", 8, 4, C_FG, C_BAR);
+    term_draw(&g_fb, &g_term, 8, 28);
+    axw_surface_damage(g_surf, 0, 0, g_fb.w, g_fb.h);
+    axw_surface_commit(g_surf);
+}
+
+static int run_axw_client(const char *initial_cmd, int uid, int gid)
 {
     struct shell_session sh;
-    struct term_state term;
     char out[TERM_OUT_CHUNK];
-    char cmd[TERM_CMD_MAX];
-    long helper = -1;
-    int evfd = cx->evfd;
     int shell_status = 1;
-    int shell_gone = 0;
-    int helper_gone = 0;
-    int out_eof = 0;
-    int closing = 0;
 
-    if (shell_spawn(&sh, uid, gid, evfd) < 0)
+    /* Connect to display server */
+    g_axw_fd = axw_connect("/devices/axw0");
+    if (g_axw_fd < 0)
+        g_axw_fd = axw_connect("/Devices/axw0");
+    if (g_axw_fd < 0)
     {
-        printf("axterm-wm: cannot start /bin/sh\n");
+        printf("axterm: cannot connect to /devices/axw0\n");
         return 1;
     }
-    if (cargv && cargc > 0)
+
+    g_disp = axw_display_create(g_axw_fd);
+    if (!g_disp)
     {
-        join_args(cargv, cargc, cmd, sizeof(cmd));
-        if (cmd[0])
+        printf("axterm: display create failed\n");
+        close(g_axw_fd);
+        return 1;
+    }
+    axw_display_set_event_handler(g_disp, axterm_axw_event_handler, NULL);
+
+    /* Bind globals */
+    struct axw_registry *reg = axw_display_get_registry(g_disp);
+    if (!reg)
+    {
+        printf("axterm: registry bind failed\n");
+        axw_display_destroy(g_disp);
+        close(g_axw_fd);
+        return 1;
+    }
+    g_comp = axw_registry_bind_compositor(reg);
+    g_shm = axw_registry_bind_shm(reg);
+    if (!g_comp || !g_shm)
+    {
+        printf("axterm: compositor/shm bind failed\n");
+        axw_display_destroy(g_disp);
+        close(g_axw_fd);
+        return 1;
+    }
+
+    /* Use axmui only for surface lifecycle (shm + buffer + surface + attach) */
+    axmui_app_t *app = axmui_app_create();
+    if (!app)
+    {
+        printf("axterm: axmui_app_create failed\n");
+        axw_display_destroy(g_disp);
+        close(g_axw_fd);
+        return 1;
+    }
+
+    axmui_window_t *win = axmui_window_create(app, "Terminal", AXTERM_W, AXTERM_H);
+    if (!win)
+    {
+        printf("axterm: axmui_window_create failed\n");
+        axmui_app_destroy(app);
+        axw_display_destroy(g_disp);
+        close(g_axw_fd);
+        return 1;
+    }
+
+    if (axmui_window_attach_axw(win, g_disp, g_comp, g_shm, AXTERM_W, AXTERM_H) < 0)
+    {
+        printf("axterm: axmui_window_attach_axw failed\n");
+        axmui_app_destroy(app);
+        axw_display_destroy(g_disp);
+        close(g_axw_fd);
+        return 1;
+    }
+    g_surf_id = win->surf_id;
+    g_surf = win->surf;
+    g_fb = win->fb; /* use axmui's framebuffer for direct drawing */
+
+    /* Destroy axmui app - we only needed it for surface lifecycle */
+    axmui_app_destroy(app);
+
+    /* Spawn shell */
+    if (shell_spawn(&sh, uid, gid) < 0)
+    {
+        printf("axterm: cannot start /bin/sh\n");
+        shm_destroy(g_shmid);
+        axw_display_destroy(g_disp);
+        close(g_axw_fd);
+        return 1;
+    }
+
+    if (initial_cmd && initial_cmd[0])
+    {
+        size_t n = strlen(initial_cmd);
+        if (n + 1 < sizeof(out))
         {
-            size_t n = strlen(cmd);
-            if (n + 1 < sizeof(cmd))
-            {
-                cmd[n++] = '\n';
-                cmd[n] = 0;
-                write_all(sh.to_shell, cmd, n);
-            }
+            out[n++] = '\n';
+            out[n] = 0;
+            write_all(sh.to_shell, out, n);
         }
     }
-    helper = sys_fork();
-    if (helper < 0)
-    {
-        kill_process_tree(sh.pid);
-        reap_child_deadline(sh.pid, 0, 2000);
-        close(sh.to_shell);
-        close(sh.from_shell);
-        return 1;
-    }
-    if (helper == 0)
-    {
-        close(sh.from_shell);
-        window_keyboard_pump(evfd, sh.to_shell, sh.pid);
-        sys_exit(0);
-    }
-    close(sh.to_shell);
-    close(evfd);
 
-    /* axmui chrome around the terminal */
-    axmui_app_t *app=axmui_app_create();
-    axmui_window_t *win=axmui_window_create(app,"Terminal", WM_WIN_W, WM_WIN_H);
-    if(!win){ kill_process_tree(sh.pid); return 1; }
-    /* attach to the already-validated window SHM */
-    axmui_window_attach(win, cx);
+    /* Keep to_shell (write end) open as g_shell_in for keyboard input. */
+    g_shell_in = sh.to_shell;
+    g_shell_pid = sh.pid;
 
-    int cols = (WM_WIN_W - 16) / FONT_WIDTH;
-    int rows = (WM_WIN_H - 16) / FONT_HEIGHT;
-    if(cols<8) cols=8; if(rows<4) rows=4;
-    term_init(&term, cols, rows);
-
-    const char *html =
-        "<div id='term' style='flex:1; background:#101418; padding:8px'></div>";
-    const char *css = ".window{ padding:0; gap:0; background:#101418; }";
-    axmui_window_set_html(win, html, css);
-    axmui_view_t *termView=axmui_view_find(axmui_window_root(win),"term");
-    if(termView){
-        axmui_view_set_draw(termView, axmui_term_draw, &term);
-        /* ensure term view expands */
-        termView->style.flex_grow=1;
-    }
-
-    /* first frame */
-    g_term_for_draw=&term;
-    axclient_begin(cx);
-    axmui_window_render(win);
-    cx->hdr->ready = 1;
-    axclient_commit(cx);
-
-    /* Make shell pipes non-blocking so we can drain compositor events
-       (especially WM_EV_RESIZE during drag) without stalling. */
+    /* Make shell output pipe non-blocking */
     fcntl(sh.from_shell, F_SETFL, O_NONBLOCK);
+
+    /* Initial render */
+    axterm_render_frame();
 
     for (;;)
     {
-        /* drain compositor events (incl. WM_EV_RESIZE) so a window resize
-           repaints the terminal buffer even when the shell is silent */
-        int resize_pending = axclient_poll_events(cx);
-        if (resize_pending > 0)
+        /* Dispatch axw events (keyboard input, etc.) */
+        int n = axw_dispatch(g_disp);
+        (void)n;
+
+        if (!g_running)
+            break;
+
+        /* Drain shell output */
+        long r = read(sh.from_shell, out, sizeof(out));
+        if (r > 0)
         {
-            /* Sync compositor-updated FB dims into axmui's copy. */
-            win->fb.w = cx->fb.w;
-            win->fb.h = cx->fb.h;
-            int cols = (cx->fb.w - 16) / FONT_WIDTH;
-            int rows = (cx->fb.h - 16) / FONT_HEIGHT;
-            if (cols < 8) cols = 8;
-            if (rows < 4) rows = 4;
-            if (cols != term.cols || rows != term.rows)
-            {
-                term_init(&term, cols, rows);
-                termView->style.flex_grow = 1;
-            }
-            axclient_begin(cx);
-            axmui_window_render(win);
-            axclient_commit(cx);
+            term_feed(&g_term, out, (size_t)r);
+            g_need_render = 1;
         }
-        long n = read(sh.from_shell, out, sizeof(out));
-        if (n > 0)
+        else if (r == 0)
         {
-            term_feed(&term, out, (size_t)n);
-            axclient_begin(cx);
-            axmui_window_render(win);
-            axclient_commit(cx);
+            g_out_eof = 1;
         }
-        else if (n == 0)
-        {
-            out_eof = 1;
-        }
-        else
-        {
-            /* EAGAIN or error: no shell output right now, not EOF. */
-            errno = 0;
-        }
-        if (axclient_closed(cx) || axclient_stale(cx))
-            closing = 1;
-        if (helper > 0 && !helper_gone)
-        {
-            long hq;
-            errno = 0;
-            hq = sys_waitpid_nb((int)helper, 0);
-            if (hq == helper || (hq < 0 && errno == ECHILD))
-            {
-                helper_gone = 1;
-                closing = 1;
-            }
-        }
-        if (!shell_gone)
+
+        /* Check if shell exited */
+        if (!g_shell_gone)
         {
             int st = 0;
             long q;
@@ -1031,36 +1007,34 @@ static int run_wm_client(struct axclient *cx, char **cargv, int cargc,
             q = sys_waitpid_nb((int)sh.pid, &st);
             if (q == sh.pid)
             {
+                g_shell_gone = 1;
+                g_shell_status = st;
                 char done[64];
-                shell_gone = 1;
-                shell_status = st;
                 snprintf(done, sizeof(done), "[shell exited, status %d]", st);
-                term_status(&term, done);
-                axclient_begin(cx);
-                axmui_window_render(win);
-                axclient_commit(cx);
+                term_status(&g_term, done);
+                g_need_render = 1;
             }
             else if (q < 0 && errno == ECHILD)
             {
-                shell_gone = 1;
+                g_shell_gone = 1;
             }
         }
-        if (closing && !shell_gone)
-            kill_process_tree(sh.pid);
-        if (out_eof && shell_gone)
+
+        /* Re-render if dirty */
+        if (g_need_render)
+        {
+            g_need_render = 0;
+            axterm_render_frame();
+        }
+
+        if (g_out_eof && g_shell_gone)
             break;
-        if (out_eof && !shell_gone)
+        if (g_out_eof && !g_shell_gone)
         {
             kill_process_tree(sh.pid);
-            if (reap_child_deadline(sh.pid, &shell_status, 2000) == 0)
+            if (reap_child_deadline(sh.pid, &g_shell_status, 2000) == 0)
             {
-                char done[64];
-                shell_gone = 1;
-                snprintf(done, sizeof(done), "[shell exited, status %d]", shell_status);
-                term_status(&term, done);
-                axclient_begin(cx);
-                axmui_window_render(win);
-                axclient_commit(cx);
+                g_shell_gone = 1;
                 break;
             }
             axgui_msleep(10);
@@ -1068,220 +1042,58 @@ static int run_wm_client(struct axclient *cx, char **cargv, int cargc,
         sys_yield();
     }
 
-    axclient_begin(cx);
-    axmui_window_render(win);
-    axclient_commit(cx);
+    /* Cleanup */
+    kill_process_tree(sh.pid);
+    if (g_shell_in >= 0)
+        close(g_shell_in);
     close(sh.from_shell);
-    if (helper > 0)
-    {
-        kill((int)helper, SIGKILL);
-        sys_waitpid((int)helper, 0);
-    }
-    if(app) axmui_app_destroy(app);
-    return shell_status;
-}
+    shm_destroy(g_shmid);
+    axw_display_destroy(g_disp);
+    close(g_axw_fd);
+    g_surf = 0;
+    g_disp = 0;
+    g_comp = 0;
+    g_shm = 0;
+    g_buf = 0;
 
-/* ---- standalone mode (fullscreen DRI terminal) ---- */
-
-/* Input pump for standalone mode: /Devices/input0 is already non-blocking,
-   so one helper can poll it while the supervisor blocks on shell output. */
-static void standalone_input_pump(int input_fd, int shell_in, long shell_pid)
-{
-    struct axinput_event ev[64];
-    (void)shell_pid;
-    for (;;)
-    {
-        int n = axgui_poll(input_fd, ev, 64);
-        int i;
-        for (i = 0; i < n; i++)
-        {
-            char seq[4];
-            int m;
-            if (ev[i].type != AXINPUT_TYPE_KEY)
-                continue;
-            m = term_key_bytes(ev[i].code, seq);
-            if (m > 0)
-                write_all(shell_in, seq, (size_t)m);
-        }
-        axgui_msleep(5);
-    }
-}
-
-static int run_standalone(void)
-{
-    struct axgui_fb fb;
-    struct shell_session sh;
-    struct term_state term;
-    char out[TERM_OUT_CHUNK];
-    int input_fd = -1;
-    long helper = -1;
-    int shell_status = 1;
-    int shell_gone = 0;
-    int helper_gone = 0;
-    int out_eof = 0;
-
-    fb.fd = -1;
-    if (axgui_dri_open(&fb) < 0)
-    {
-        printf("axterm: no DRI device (need GOP framebuffer)\n");
-        return 1;
-    }
-    input_fd = axgui_input_open();
-    if (input_fd >= 0)
-        axgui_grab(input_fd, 1);
-    close_extra_fds(input_fd, fb.fd, -1, -1);
-    if (shell_spawn(&sh, -1, -1, -1) < 0)
-    {
-        printf("axterm: cannot start /bin/sh\n");
-        goto stand_fail;
-    }
-    helper = sys_fork();
-    if (helper < 0)
-    {
-        kill_process_tree(sh.pid);
-        reap_child_deadline(sh.pid, 0, 2000);
-        close(sh.to_shell);
-        close(sh.from_shell);
-        goto stand_fail;
-    }
-    if (helper == 0)
-    {
-        close(sh.from_shell);
-        /* Keep only the console stdio, the polled input device and the
-           shell's stdin. In particular the helper must not retain the DRI
-           framebuffer descriptor owned by the supervisor. */
-        close_extra_fds(input_fd, sh.to_shell, -1, -1);
-        standalone_input_pump(input_fd, sh.to_shell, sh.pid);
-        sys_exit(0);
-    }
-    /* Supervisor/renderer owns the display and the shell's output. */
-    close(sh.to_shell);
-
-    term_init(&term, (int)fb.w / FONT_WIDTH,
-              ((int)fb.h - 24 - 8) / FONT_HEIGHT);
-    axgui_fill(&fb, 0, 0, (int)fb.w, (int)fb.h, C_BG);
-    axgui_fill(&fb, 0, 0, (int)fb.w, 24, C_BAR);
-    axgui_text(&fb, "axterm - /bin/sh", 8, 4, C_FG, C_BAR);
-    term_draw(&fb, &term, 8, 28);
-    axgui_present(&fb);
-
-    for (;;)
-    {
-        long n = read(sh.from_shell, out, sizeof(out));
-        if (n > 0)
-        {
-            term_feed(&term, out, (size_t)n);
-            axgui_fill(&fb, 0, 0, (int)fb.w, 24, C_BAR);
-            axgui_text(&fb, "axterm - /bin/sh", 8, 4, C_FG, C_BAR);
-            term_draw(&fb, &term, 8, 28);
-            axgui_present(&fb);
-        }
-        else if (n == 0)
-        {
-            out_eof = 1;
-        }
-        else
-        {
-            out_eof = 1;
-        }
-        if (helper > 0 && !helper_gone)
-        {
-            long hq;
-            errno = 0;
-            hq = sys_waitpid_nb((int)helper, 0);
-            if (hq == helper || (hq < 0 && errno == ECHILD))
-                helper_gone = 1;
-        }
-        if (!shell_gone)
-        {
-            int st = 0;
-            long q;
-            errno = 0;
-            q = sys_waitpid_nb((int)sh.pid, &st);
-            if (q == sh.pid)
-            {
-                shell_gone = 1;
-                shell_status = st;
-            }
-            else if (q < 0 && errno == ECHILD)
-            {
-                shell_gone = 1;
-            }
-        }
-        if (helper_gone && !shell_gone)
-            kill_process_tree(sh.pid);
-        if (out_eof && shell_gone)
-            break;
-        if (out_eof && !shell_gone)
-        {
-            kill_process_tree(sh.pid);
-            if (reap_child_deadline(sh.pid, &shell_status, 2000) == 0)
-            {
-                shell_gone = 1;
-                break;
-            }
-            axgui_msleep(10);
-        }
-    }
-
-    if (helper > 0)
-    {
-        /* The standalone helper polls with syscalls, so SIGKILL reaches it
-           promptly and the blocking reap below is safe. */
-        kill(helper, SIGKILL);
-        sys_waitpid((int)helper, 0);
-    }
-    close(sh.from_shell);
-    if (input_fd >= 0)
-    {
-        axgui_grab(input_fd, 0);
-        close(input_fd);
-    }
-    axgui_close(&fb);
-    printf("\n[axterm closed]\n");
-    return shell_status;
-
-stand_fail:
-    if (input_fd >= 0)
-    {
-        axgui_grab(input_fd, 0);
-        close(input_fd);
-    }
-    axgui_close(&fb);
-    return 1;
+    return g_shell_status;
 }
 
 int main(int argc, char **argv)
 {
-    /* Compositor client: `axterm --wm <shmid> <w> <h> <evfd> [<gen>]
-       [--user <uid> <gid>] [-c cmd...]`. */
-    if (argc >= 6 && strcmp(argv[1], "--wm") == 0)
+    const char *initial_cmd = 0;
+    int uid = -1;
+    int gid = -1;
+
+    /* Parse args: axterm [-c cmd...] [--user <uid> <gid>] */
+    int i = 1;
+    while (i < argc)
     {
-        struct axclient cx;
-        char **cargv = 0;
-        int cargc = 0;
-        int uid = -1;
-        int gid = -1;
-        int rest = axclient_init(&cx, argc, argv, "axterm");
-        long u, g;
-        if (rest < 0)
-            return 1;
-        if (argc > rest + 2 && strcmp(argv[rest], "--user") == 0 &&
-            axclient_parse_num(argv[rest + 1], &u) == 0 && u >= 0 &&
-            axclient_parse_num(argv[rest + 2], &g) == 0 && g >= 0)
+        if (strcmp(argv[i], "-c") == 0 && i + 1 < argc)
         {
-            uid = (int)u;
-            gid = (int)g;
-            rest += 3;
+            initial_cmd = argv[i + 1];
+            i += 2;
         }
-        if (argc > rest + 1 && strcmp(argv[rest], "-c") == 0 &&
-            argc > rest + 2)
+        else if (strcmp(argv[i], "--user") == 0 && i + 2 < argc)
         {
-            cargv = &argv[rest + 1];
-            cargc = argc - (rest + 1);
+            long u, g;
+            char *end;
+            u = strtol(argv[i + 1], &end, 10);
+            g = strtol(argv[i + 2], &end, 10);
+            if (*end == 0 && u >= 0 && g >= 0)
+            {
+                uid = (int)u;
+                gid = (int)g;
+            }
+            i += 3;
         }
-        return run_wm_client(&cx, cargv, cargc, uid, gid);
+        else
+        {
+            i++;
+        }
     }
 
-    return run_standalone();
+    (void)initial_cmd;
+
+    return run_axw_client(initial_cmd, uid, gid);
 }

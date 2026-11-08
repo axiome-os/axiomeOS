@@ -117,8 +117,9 @@
 #define SYS_SHM_DESTROY   74   /* sys_shm_destroy(id): free a shared memory segment */
 
 #define SYS_FCNTL         75   /* sys_fcntl(fd, cmd, arg): file descriptor control */
+#define SYS_IOCTL         76   /* sys_ioctl(fd, request, arg): device control */
 
-#define __SYS_LAST        76   /* one past the highest number */
+#define __SYS_LAST        77   /* one past the highest number */
 
 /* File descriptor flags (for fcntl F_GETFL / F_SETFL). */
 #define O_NONBLOCK        04000

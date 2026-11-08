@@ -1,6 +1,7 @@
 /* axoobe — GUI first-boot setup (axiomeOS /Binaries/axoobe)
  * Rebuilt on axmui: native HTML+CSS.
  */
+#include "axclient.h"
 #include "axmui/axmui.h"
 #include "axsha256.h"
 
@@ -93,7 +94,6 @@ int main(int argc,char **argv){
         if(closeBtn) axmui_view_on_click(closeBtn, on_any_key_nouser, NULL);
         axmui_window_on_key(g_win, on_any_key_nouser, NULL);
         struct axclient cx; int rest=axclient_init(&cx,argc,argv,"axoobe"); if(rest<0) return 0;
-        axmui_window_attach(g_win,&cx);
         axclient_begin(&cx); axmui_window_render(g_win); cx.hdr->ready=1; axclient_commit(&cx);
         uint32_t prev_btn2=0;
         while(g_app->running){
@@ -140,7 +140,6 @@ int main(int argc,char **argv){
 
     /* custom loop that also handles Enter on inputs via on_change */
     struct axclient cx; int rest=axclient_init(&cx,argc,argv,"axoobe"); if(rest<0) return 1;
-    axmui_window_attach(g_win,&cx);
     axclient_begin(&cx); axmui_window_render(g_win); cx.hdr->ready=1; axclient_commit(&cx);
     uint32_t prev_btn=0;
     while(g_app->running){

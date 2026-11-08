@@ -187,6 +187,11 @@ int fcntl(int fd, int cmd, int arg)
     return (int)syscall(SYS_FCNTL, fd, cmd, arg, 0, 0, 0);
 }
 
+long ioctl(int fd, unsigned long request, void *arg)
+{
+    return syscall(SYS_IOCTL, (long)fd, (long)request, (long)arg, 0, 0, 0);
+}
+
 int sock_create(int domain, int type, int proto)
 {
     return (int)syscall(SYS_SOCKET_CREATE, (long)domain, (long)type,

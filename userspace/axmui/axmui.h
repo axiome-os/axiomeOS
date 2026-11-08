@@ -46,7 +46,7 @@
 #define AXMUI_H
 
 #include "../axgui.h"
-#include "../axclient.h"
+#include "../libaxw/axw-client.h"
 #include "stdlib.h"
 #include "string.h"
 #include "stdio.h"
@@ -204,7 +204,14 @@ struct axmui_sheet {
 /* ------------------------------------------------------------------ */
 /*  Window / App                                                        */
 struct axmui_window {
-    struct axclient cx;
+    struct axw_display *disp;
+    struct axw_compositor *comp;
+    struct axw_shm *shm;
+    struct axw_surface *surf;
+    struct axw_buffer *buf;
+    long shmid;
+    uint8_t *buf_map;
+    uint32_t surf_id;
     axmui_view_t *root;
     struct axmui_sheet sheet;
     axmui_view_t *focused;  /* input */
@@ -231,25 +238,28 @@ struct axmui_app {
 /* caps helpers (GUI asks hdr for gfx caps) */
 static inline uint64_t axmui_window_caps(axmui_window_t *win)
 {
-    if (!win || !win->cx.hdr) return 0;
-    return win->cx.hdr->gfx_caps;
+    (void)win;
+    return 0;
 }
 static inline int axmui_has_cap(axmui_window_t *win, uint64_t cap)
 {
-    return (axmui_window_caps(win) & cap) != 0;
+    (void)win; (void)cap;
+    return 0;
 }
 static inline const char *axmui_detail_mode(axmui_window_t *win)
 {
-    if (!win || !win->cx.hdr) return "simplified";
-    return win->cx.hdr->gfx_detail ? "detailed" : "simplified";
+    (void)win;
+    return "simplified";
 }
 static inline int axmui_should_blur(axmui_window_t *win)
 {
-    return axmui_has_cap(win, WM_GFX_CAP_BLUR);
+    (void)win;
+    return 0;
 }
 static inline int axmui_should_shadow(axmui_window_t *win)
 {
-    return axmui_has_cap(win, WM_GFX_CAP_SHADOWS);
+    (void)win;
+    return 0;
 }
 
 /* ================================================================== */
@@ -1599,14 +1609,39 @@ static void axmui_window_set_html(axmui_window_t *win, const char *html, const c
 static axmui_view_t *axmui_window_root(axmui_window_t *win){ return win? win->root:0; }
 static void axmui_window_on_key(axmui_window_t *win, axmui_callback_t cb, void *ud){ if(win){ win->on_key=cb; win->on_key_data=ud; } }
 
-/* attach to guixd window SHM and start loop; returns when window closed */
-static int axmui_window_attach(axmui_window_t *win, struct axclient *cx){
-    if(!win||!cx) return -1;
-    win->cx=*cx;
-    win->fb=cx->fb;
-    /* adopt FB dimensions: root covers full window content */
-    win->root->w = (int)cx->fb.w;
-    win->root->h = (int)cx->fb.h;
+/* attach to axw display server surface; returns when window closed */
+static int axmui_window_attach_axw(axmui_window_t *win,
+                                   struct axw_display *disp,
+                                   struct axw_compositor *comp,
+                                   struct axw_shm *shm,
+                                   int w, int h)
+{
+    if(!win||!disp||!comp||!shm) return -1;
+    win->disp = disp;
+    win->comp = comp;
+    win->shm = shm;
+    win->shmid = shm_create((size_t)w * h * 4);
+    if(win->shmid <= 0) return -1;
+    win->buf_map = (uint8_t *)shm_attach(win->shmid);
+    if(!win->buf_map) { shm_destroy(win->shmid); return -1; }
+    win->buf = axw_shm_create_pool(shm, win->shmid, (uint32_t)w, (uint32_t)h,
+                                   AXW_FORMAT_XRGB8888);
+    if(!win->buf) { shm_destroy(win->shmid); return -1; }
+    win->surf = axw_compositor_create_surface(comp);
+    if(!win->surf) { shm_destroy(win->shmid); return -1; }
+    axw_surface_attach(win->surf, win->buf, 0, 0);
+    win->surf_id = axw_surface_id(win->surf);
+
+    win->fb.fd = -1;
+    win->fb.w = (uint32_t)w;
+    win->fb.h = (uint32_t)h;
+    win->fb.pitch = (uint32_t)w * 4;
+    win->fb.handle = win->buf->id;
+    win->fb.size = (uint64_t)w * h * 4;
+    win->fb.px = (uint32_t *)win->buf_map;
+
+    win->root->w = w;
+    win->root->h = h;
     return 0;
 }
 
@@ -1621,7 +1656,9 @@ static void axmui_window_render(axmui_window_t *win){
     if(win->root->style.bg!=0xFFFFFFFFu) clear=win->root->style.bg;
     axmui_fill_rect(&win->fb, 0,0, win->fb.w, win->fb.h, clear);
     axmui_render_node(&win->fb, win->root);
-    /* seqlock publish already handled by caller via axclient_begin/commit */
+    /* commit surface to compositor */
+    axw_surface_damage(win->surf, 0, 0, win->fb.w, win->fb.h);
+    axw_surface_commit(win->surf);
 }
 
 /* simple UTF helpers for input */
@@ -1649,144 +1686,154 @@ static axmui_app_t *axmui_app_create(void){
 }
 static void axmui_app_destroy(axmui_app_t *a){ if(a){ if(a->win) free(a->win); free(a); } }
 
-/* High-level run loop that hides axclient boilerplate.
- * Each app process is launched as `prog --wm <shmid> <w> <h> <evfd> <gen> ...`.
- * This mirrors axclient_init: validates argv, attaches SHM, then enters the
- * event loop. For non-window contexts (tests), create window manually.
+/* High-level run loop that hides axw boilerplate.
+ * Connects to /devices/axw0, creates an axw surface + shm buffer,
+ * then enters the event loop.
  */
+static struct axw_display *g_axw_disp = 0;
+static struct axw_compositor *g_axw_comp = 0;
+static struct axw_shm *g_axw_shm = 0;
+static axmui_window_t *g_axw_win = 0;
+static uint32_t g_axw_prev_btn = 0;
+
+static int axw_axmui_event_handler(struct axw_display *d,
+                                   uint32_t sender_id,
+                                   uint16_t opcode,
+                                   const uint32_t *args, int nargs)
+{
+    (void)d;
+    axmui_window_t *win = g_axw_win;
+    if(!win || !win->surf) return 0;
+
+    /* Server broadcasts all pointer/key events to every client.
+       Only process events addressed to our own surface. */
+    if(sender_id != win->surf_id) return 0;
+
+    if(opcode == AXW_POINTER_MOTION || opcode == AXW_POINTER_BUTTON)
+    {
+        if(nargs < 3) return 0;
+        int32_t x = (int32_t)(args[1] & 0xFFFFu);
+        int32_t y = (int32_t)((args[1] >> 16) & 0xFFFFu);
+        uint32_t btn = args[2];
+        /* Convert surface-local coords back to window-local (surface is at 0,0)
+           but subtract frame offset if compositor adds decorations. For now
+           surface coords == content coords. */
+        axmui_handle_mouse(win, x, y, btn, &g_axw_prev_btn);
+        win->needs_render = 1;
+        return 0;
+    }
+    if(opcode == AXW_KEYBOARD_KEY)
+    {
+        if(nargs < 2) return 0;
+        uint32_t kc = args[1];
+        /* Tab / Up/Down cycles focus */
+        if(kc=='\t' || kc==AXINPUT_KEY_DOWN || kc==AXINPUT_KEY_UP){
+            int dir = (kc==AXINPUT_KEY_UP) ? -1 : 1;
+            axmui_view_t *list[AXMUI_MAX_NODES]; int n=0;
+            for(int k=0;k<win->pool_used;k++){
+                axmui_view_t *nd=&win->pool[k];
+                if((axmui_str_case_eq(nd->tag,"input")||axmui_str_case_eq(nd->tag,"button")) && nd->style.display!=AXMUI_DISPLAY_NONE)
+                    list[n++]=nd;
+            }
+            if(n>0){
+                int idx=-1;
+                for(int k=0;k<n;k++) if(list[k]==win->focused) idx=k;
+                int nxt = (idx+dir+n)%n;
+                win->focused=list[nxt];
+                for(int k=0;k<win->pool_used;k++) win->pool[k].focused=0;
+                list[nxt]->focused=1;
+                win->needs_render=1;
+            }
+        } else {
+            axmui_view_t *f=win->focused;
+            int handled=0;
+            if(f && axmui_str_case_eq(f->tag,"input")){
+                if(kc==127||kc==8){
+                    axmui_input_backspace(f);
+                    if(f->on_input) f->on_input(f,f->on_input_data); handled=1;
+                } else if(kc=='\n'||kc=='\r'){
+                    if(f->on_change) f->on_change(f,f->on_change_data); handled=1;
+                } else if(kc>=32 && kc<127){
+                    axmui_input_append(f,(char)kc);
+                    if(f->on_input) f->on_input(f,f->on_input_data); handled=1;
+                }
+                win->needs_render=1;
+            } else {
+                if(kc=='\n'||kc=='\r'){
+                    if(f && axmui_str_case_eq(f->tag,"button") && f->on_click){
+                        f->on_click(f, f->on_click_data);
+                        win->needs_render=1; handled=1;
+                    }
+                }
+            }
+            if(!handled && win->on_key){
+                win->on_key(0, win->on_key_data);
+            }
+        }
+        return 0;
+    }
+    return 0;
+}
+
 static int axmui_app_run(axmui_app_t *app, int argc, char **argv, const char *prog){
-    struct axclient cx;
-    int rest;
-    if(!app||!prog) return 1;
+    (void)argc; (void)argv; (void)prog;
+    if(!app) return 1;
     if(!app->win){
-        app->win=axmui_window_create(app, prog, WM_WIN_W, WM_WIN_H);
+        app->win=axmui_window_create(app, "axmui", WM_WIN_W, WM_WIN_H);
         if(!app->win) return 1;
     }
-    rest=axclient_init(&cx, argc, argv, prog);
-    if(rest<0) return 1;
-    axmui_window_attach(app->win, &cx);
     axmui_window_t *win=app->win;
 
-    /* initial render */
-    axclient_begin(&cx);
-    axmui_window_render(win);
-    cx.hdr->ready=1;
-    axclient_commit(&cx);
+    /* Connect to display server */
+    int fd = axw_connect("/devices/axw0");
+    if(fd < 0) fd = axw_connect("/Devices/axw0");
+    if(fd < 0) return 1;
 
-    uint32_t prev_btn=0;
-    while(app->running){
-        struct wm_event ev;
-        if(axclient_closed(&cx) || axclient_stale(&cx)) break;
-        /* poll with blocking recv but with timeout: use nonblocking poll + sleep */
-        /* We do a blocking recv with short busy: try poll first */
-        /* Use wm_recv in nonblocking style: set fd to nonblock? axclient_recv blocks.
-           For axmui we want to handle hover/timeouts, so we use try + msleep.
-           Simplify: use a helper that tries nonblock via read polling is not available.
-           Instead we use axgui_poll style but for wm pipe we have to use blocking with timeout via fork? easiest: use blocking recv in dedicated pump? 
-           Here we implement poll via read with O_NONBLOCK check: we peek if data available via read with 0 timeout by trying recv with MSG_DONTWAIT not available.
-           Fallback: block on recv but render on each event – responsiveness still okay because hover needs move events which will arrive.
-           So we block on recv; idle redraw not needed except focus blink.
-        */
-        if(axgui_wm_recv(cx.evfd, &ev) < 0) break;
-        if(axclient_closed(&cx) || axclient_stale(&cx)) break;
-        if(ev.type==WM_EV_MOUSE){
-            axmui_handle_mouse(win, ev.x, ev.y, ev.code, &prev_btn);
-            win->needs_render=1;
-        } else if(ev.type==WM_EV_KEY){
-            /* Tab / Up/Down cycles focus */
-            if(ev.code=='\t' || ev.code==AXINPUT_KEY_DOWN || ev.code==AXINPUT_KEY_UP){
-                int dir = (ev.code==AXINPUT_KEY_UP) ? -1 : 1;
-                axmui_view_t *list[AXMUI_MAX_NODES]; int n=0;
-                for(int k=0;k<win->pool_used;k++){
-                    axmui_view_t *nd=&win->pool[k];
-                    if((axmui_str_case_eq(nd->tag,"input")||axmui_str_case_eq(nd->tag,"button")) && nd->style.display!=AXMUI_DISPLAY_NONE)
-                        list[n++]=nd;
-                }
-                if(n>0){
-                    int idx=-1;
-                    for(int k=0;k<n;k++) if(list[k]==win->focused) idx=k;
-                    int nxt = (idx+dir+n)%n;
-                    win->focused=list[nxt];
-                    /* clear focused flags */
-                    for(int k=0;k<win->pool_used;k++) win->pool[k].focused=0;
-                    list[nxt]->focused=1;
-                    win->needs_render=1;
-                }
-            } else {
-                axmui_view_t *f=win->focused;
-                int handled=0;
-                if(f && axmui_str_case_eq(f->tag,"input")){
-                    if(ev.code==127||ev.code==8){
-                        axmui_input_backspace(f);
-                        if(f->on_input) f->on_input(f,f->on_input_data); handled=1;
-                    } else if(ev.code=='\n'||ev.code=='\r'){
-                        if(f->on_change) f->on_change(f,f->on_change_data); handled=1;
-                    } else if(ev.code>=32 && ev.code<127){
-                        axmui_input_append(f,(char)ev.code);
-                        if(f->on_input) f->on_input(f,f->on_input_data); handled=1;
-                    }
-                    win->needs_render=1;
-                } else {
-                    if(ev.code=='\n'||ev.code=='\r'){
-                        if(f && axmui_str_case_eq(f->tag,"button") && f->on_click){
-                            f->on_click(f, f->on_click_data);
-                            win->needs_render=1; handled=1;
-                        }
-                    }
-                }
-                if(!handled && win->on_key){
-                    win->on_key(0, win->on_key_data);
-                    /* let handler decide to close */
-                }
-            }
-        } else if(ev.type==WM_EV_RESIZE){
-            /* compositor resized the window: if code != 0, the SHM segment
-               was reallocated — reattach to the new buffer. If code == 0,
-               it's a live resize: same buffer, new logical dims only. */
-            if (ev.code != 0)
-            {
-                uint8_t *new_base = (uint8_t *)shm_attach((long)ev.code);
-                if (new_base)
-                {
-                    struct wm_win_hdr *new_hdr =
-                        (struct wm_win_hdr *)new_base;
-                    if (new_hdr->magic == WM_MAGIC)
-                    {
-                        shm_destroy(cx.shmid);
-                        cx.shmid = (long)ev.code;
-                        cx.hdr = new_hdr;
-                        cx.fb.w = new_hdr->w;
-                        cx.fb.h = new_hdr->h;
-                        cx.fb.pitch = new_hdr->pitch;
-                        cx.fb.size =
-                            (uint64_t)new_hdr->w * new_hdr->h * 4;
-                        cx.fb.px =
-                            (uint32_t *)(new_base + WM_HDR_SIZE);
-                        cx.fb.fd = -1;
-                        cx.fb.handle = 0;
-                        win->fb = cx.fb;
-                    }
-                }
-            }
-            else
-            {
-                /* Live resize: same SHM buffer, just new logical dimensions.
-                   Buffer pitch stays fixed at hdr->pitch (WM_SHM_MAX_W * 4). */
-                cx.fb.w = (uint32_t)ev.x;
-                cx.fb.h = (uint32_t)ev.y;
-                win->fb.w = (uint32_t)ev.x;
-                win->fb.h = (uint32_t)ev.y;
-            }
-            win->root->w = (int)ev.x;
-            win->root->h = (int)ev.y;
-            win->needs_layout = 1;
-            win->needs_render = 1;
-        }
-        /* re-render if dirty */
-        axclient_begin(&cx);
-        axmui_window_render(win);
-        axclient_commit(&cx);
+    struct axw_display *disp = axw_display_create(fd);
+    if(!disp) { close(fd); return 1; }
+    axw_display_set_event_handler(disp, axw_axmui_event_handler, NULL);
+
+    struct axw_registry *reg = axw_display_get_registry(disp);
+    if(!reg) { axw_display_destroy(disp); close(fd); return 1; }
+    struct axw_compositor *comp = axw_registry_bind_compositor(reg);
+    struct axw_shm *shm = axw_registry_bind_shm(reg);
+    if(!comp || !shm) { axw_display_destroy(disp); close(fd); return 1; }
+
+    g_axw_disp = disp;
+    g_axw_comp = comp;
+    g_axw_shm = shm;
+    g_axw_win = win;
+    g_axw_prev_btn = 0;
+
+    if(axmui_window_attach_axw(win, disp, comp, shm, WM_WIN_W, WM_WIN_H) < 0)
+    {
+        axw_display_destroy(disp);
+        close(fd);
+        return 1;
     }
+
+    /* initial render */
+    axmui_window_render(win);
+
+    while(app->running){
+        int n = axw_dispatch(disp);
+        (void)n;
+        /* re-render if dirty */
+        if(win->needs_render){
+            win->needs_render = 0;
+            axmui_window_render(win);
+        }
+        sys_yield();
+    }
+
+    /* Cleanup */
+    shm_destroy(win->shmid);
+    axw_display_destroy(disp);
+    close(fd);
+    g_axw_win = 0;
+    g_axw_disp = 0;
+    g_axw_comp = 0;
+    g_axw_shm = 0;
     return 0;
 }
 

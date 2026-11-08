@@ -1,53 +1,64 @@
 # Graphics stack
 
-## Layers
+## Layers (Phase 1-2 implemented)
 
 ```
- userspace (Mesa softpipe/llvmpipe -> libAXGL -> /dev/dri/card0)
-        |
- kernel/gfx (C++ abstraction, this directory)
-   IDisplay -------------------- display_manager (select_best)
-     |                                |
- GopDisplay (live)   IntelDisplay (stub)   BochsDisplay (stub)
-     |
- kernel/framebuffer.c (text console + WC flush, dirty-rect)
-     |
- UEFI GOP (bootloader/gop.c captures mode, mmu_map_framebuffer maps WC)
+ userspace (axw protocol client -> libaxw -> /devices/axw0)
+                              |
+ userspace (axdisplay-server: DRM master + axw protocol server)
+                              |
+ kernel/drm (DRM core + KMS + GEM, GOP backend)
+   drm_device --------------- drm_ioctl dispatcher
+     |                           |
+   drm_connector          drm_gem_object (buffer objects, mmap)
+   drm_crtc               drm_framebuffer (scanout wrapper)
+   drm_plane
+                              |
+ kernel/framebuffer.c (text console, shares scanout fb)
+                              |
+ UEFI GOP (bootloader/gop.c captures mode, WC mapping)
 ```
 
-## Rules
+## Device nodes
 
-* Portable code talks to `gfx::*` (`manager.h`) or the C ABI
-  (`gfx_init/gfx_clear/gfx_fill_rect/gfx_present/gfx_mode/gfx_cpu_base`).
-  Nothing outside `kernel/gfx/*_display.cpp` touches PCI BARs, GOP state,
-  or `fb_*` internals directly.
-* `IDisplay::probe()` is read-only. `init()` may modeset. A stub backend
-  returns `probe()==true, init()==false` so the manager logs the hardware
-  but keeps GOP as scanout owner.
-* Priority decides the winner: GOP=10, Bochs=20, Intel=30. A fully
-  modeset-capable native driver automatically wins once its `init()`
-  starts returning true — no manager changes needed.
+- `/dev/dri/card0` → `/devices/card0` — DRM device (ioctl + mmap + write-command compat)
+- `/devices/axw0` — axw display server protocol (multiplexed, first opener = server)
+- `/devices/dri0` — legacy DRI compat (write-based `axdri_cmd` protocol, kept for `gfx_test`)
+- `/devices/input0` — unified GUI input queue
 
-## Bringing Intel online (staged)
+## DRM ioctls (write()-based `struct drm_cmd` + `SYS_IOCTL`)
 
-1. `IntelDisplay::probe()` already records bus/dev/func, device ID, BAR0.
-2. Next: map BAR0 via `hal::mmio()`, init GTT, light the display pipe at
-   the GOP mode (no mode enumeration yet), implement `fill_rect` with the
-   blitter, flip `caps.has_hw_fill/blit` on.
-3. Then: full modeset (EDID, PLL, pipe), `present()` becomes page-flip,
-   `init()` returns true and GOP retires to fallback.
+```
+GET_RESOURCES, GET_CONNECTOR, GET_CRTC, SET_CRTC, PAGE_FLIP, DIRTYFB,
+GEM_CREATE, GEM_MMAP, GEM_FREE, GET_MODE, GET_CAPS, SET_MASTER, DROP_MASTER
+```
 
-Same staging applies to `BochsDisplay` (VBE dispi ports / virtio-gpu
-virtqueues) for QEMU `-vga std`.
+## axw protocol objects
 
-## GOP bug that was fixed here
+```
+axw_display      — sync, get_registry, terminate
+axw_registry     — bind globals
+axw_compositor   — create_surface
+axw_shm          — create_pool (GEM-backed shm segment)
+axw_buffer       — client-created, from shm pool
+axw_surface      — attach, damage, commit
+axw_seat         — get_pointer, get_keyboard
+axw_output       — geometry, mode, done
+axw_callback     — done (frame callback)
+```
 
-`framebuffer.c::shift_rows_up()` used `memcpy` on overlapping rows (UB —
-gcc may copy backwards and smear glyphs), only scrolled
-`(rows-1)*16` lines, cleared only the last text row, and dirtied
-`(0,0,W,H-16)`. On modes whose height is not a multiple of 16 (e.g.
-600p = 37*16+8) the 8px remainder strip was never scrolled, cleared, or
-flushed — the "parts not cleared" bars. Fix: `memmove` line-by-line,
-`fill_lines(scroll_h, height, bg)` covering text row + remainder, one
-full-screen dirty rect, `set_pixel`/`fill_row` hardened for non-32bpp,
-`fb_clear` honours `bg_color`.
+Wire format: `u32 sender_id, u16 opcode, u16 size, u32 args[]` over `/devices/axw0`.
+
+## What was removed/replaced
+
+- `kernel/dri.c` write-command path is now the DRM core (`drm_sys_write` handles `struct drm_cmd`)
+- `kernel/axdri_cmd.h` → `kernel/drm/drm_ioctl.h` (old header kept for `gfx_test` compat)
+- `kernel/gfx/mesa_abi.h` → superseded by `drm_ioctl.h`
+- `userspace/guixd.c`, `userspace/compositor.h`, `userspace/axclient.h`, `kernel/wm_abi.h` — legacy SHM seqlock protocol, still present but superseded by axw protocol
+
+## What stays (by design)
+
+- **GOP only** — no Intel/Bochs/virtio hardware drivers yet
+- **Single compositor session** — no multi-seat/VT switching
+- **`axgui_*` 2D primitives** — used by axdisplay-server for compositing
+- **`axmui` HTML/CSS toolkit** — retained, render backend can migrate to axw buffers

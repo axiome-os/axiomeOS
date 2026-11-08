@@ -65,6 +65,7 @@ Binaries/ping               0755  0  0  f  bin:userspace/ping.elf
 Binaries/gfx_test           0755  0  0  f  bin:userspace/gfx_test.elf
 Binaries/axwm               0755  0  0  f  bin:userspace/axwm.elf
 Binaries/guixd               0755  0  0  f  bin:userspace/guixd.elf
+Binaries/axdisplay-server    0755  0  0  f  bin:userspace/axdisplay-server.elf
 Binaries/axterm             0755  0  0  f  bin:userspace/axterm.elf
 Binaries/evtest             0755  0  0  f  bin:userspace/evtest.elf
 Binaries/axinfo             0755  0  0  f  bin:userspace/axinfo.elf

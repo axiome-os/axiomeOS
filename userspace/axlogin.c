@@ -3,6 +3,7 @@
  * Shows username/password form. On success authenticates, records session
  * in /var/run/axlogin.<shmid> and exits 0 so guixd can spawn the user session.
  */
+#include "axclient.h"
 #include "axmui/axmui.h"
 #include "axsha256.h"
 
@@ -171,9 +172,7 @@ int main(int argc, char **argv){
     int rest=axclient_init(&cx, argc, argv, "axlogin");
     if(rest<0) return 1;
     g_cxptr=&cx;
-    /* attach window fb */
-    axmui_window_attach(g_win, &cx);
-    /* if nouser, keep status already set; need to re-render initial frame */
+    /* axclient_init already attached via axgui_win_attach; render initial frame */
     axclient_begin(&cx);
     axmui_window_render(g_win);
     cx.hdr->ready=1;

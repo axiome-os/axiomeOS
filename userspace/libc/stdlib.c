@@ -199,6 +199,60 @@ long atol(const char *s)
     return neg ? -v : v;
 }
 
+long strtol(const char *nptr, char **endptr, int base)
+{
+    const char *s = nptr;
+    long v = 0;
+    int neg = 0;
+    int overflow = 0;
+    if (!s)
+    {
+        if (endptr) *endptr = (char *)nptr;
+        return 0;
+    }
+    while (*s == ' ' || *s == '\t' || *s == '\n' || *s == '\r')
+        s++;
+    if (*s == '-')
+    {
+        neg = 1;
+        s++;
+    }
+    else if (*s == '+')
+    {
+        s++;
+    }
+    if (base == 10)
+    {
+        const char *start = s;
+        while (*s >= '0' && *s <= '9')
+        {
+            long nd = v * 10 + (*s - '0');
+            if (nd < v) overflow = 1;
+            v = nd;
+            s++;
+        }
+        if (s == start)
+        {
+            /* No digits: return 0 and endptr points to start */
+            if (endptr) *endptr = (char *)nptr;
+            return 0;
+        }
+        if (overflow)
+        {
+            v = neg ? -2147483647L - 1 : 2147483647L;
+        }
+    }
+    else
+    {
+        /* Only base 10 supported for now */
+        if (endptr) *endptr = (char *)nptr;
+        return 0;
+    }
+    if (neg) v = -v;
+    if (endptr) *endptr = (char *)s;
+    return v;
+}
+
 void abort(void)
 {
     syscall(SYS_EXIT, 134, 0, 0, 0, 0, 0);

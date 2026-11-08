@@ -9,6 +9,7 @@ void *realloc(void *ptr, size_t size);
 void free(void *p);
 int atoi(const char *s);
 long atol(const char *s);
+long strtol(const char *nptr, char **endptr, int base);
 void abort(void);
 void exit(int status);
 char *getenv(const char *name);
