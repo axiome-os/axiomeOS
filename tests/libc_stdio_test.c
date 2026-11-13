@@ -4,7 +4,10 @@
 #include <stdint.h>
 
 /* Declare only the functions under test so the host <stdio.h> pulled in by
-   test_util.h keeps providing printf/fprintf for the test harness. */
+   test_util.h keeps providing printf/fprintf for the test harness. macOS
+   turns sprintf/snprintf into fortify macros, so undo that first. */
+#undef sprintf
+#undef snprintf
 extern int sprintf(char *str, const char *fmt, ...);
 extern int snprintf(char *str, size_t size, const char *fmt, ...);
 

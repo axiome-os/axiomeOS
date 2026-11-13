@@ -32,7 +32,13 @@ long write(int fd, const void *buf, size_t len)
 {
 #if defined(__x86_64__)
     long ret;
+#if defined(__APPLE__)
+    /* Darwin encodes the syscall class in the high bits: write is
+       0x2000000 | 4. A bare 1 is exit(2), which kills the test process. */
+    register long r0 __asm__("rax") = 0x2000004; /* SYS_write */
+#else
     register long r0 __asm__("rax") = 1; /* SYS_write */
+#endif
     register long r1 __asm__("rdi") = fd;
     register long r2 __asm__("rsi") = (long)buf;
     register long r3 __asm__("rdx") = (long)len;

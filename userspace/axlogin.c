@@ -145,8 +145,8 @@ int main(int argc, char **argv){
     /* Enter in an input fires on_change -> do_login (wired below). */
     axmui_view_t *user=axmui_view_find(axmui_window_root(g_win),"user");
     axmui_view_t *pv=axmui_view_find(axmui_window_root(g_win),"pass");
-    if(user){ user->on_change=do_login; g_win->focused=user; user->focused=1; }
-    if(pv) pv->on_change=do_login;
+    if(user){ user->on_change=on_login_click; g_win->focused=user; user->focused=1; }
+    if(pv) pv->on_change=on_login_click;
 
     if(nologin) set_status("No user account exists yet: run First-boot setup first.");
 

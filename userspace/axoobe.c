@@ -186,9 +186,9 @@ int main(int argc,char **argv){
 
     /* Enter on inputs / create button -> create account. */
     axmui_view_t *pass=axmui_view_find(axmui_window_root(g_win),"pass");
-    if(user) user->on_change=create_account;
-    if(pass) pass->on_change=create_account;
-    if(cv) cv->on_change=create_account;
+    if(user) user->on_change=on_create;
+    if(pass) pass->on_change=on_create;
+    if(cv) cv->on_change=on_create;
 
     axmui_app_run(g_app, argc, argv, "axoobe");
     return g_created?0:1;

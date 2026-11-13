@@ -2,19 +2,56 @@ REPO_ROOT := $(realpath .)
 BUILD_DIR := $(REPO_ROOT)/build
 
 # Tool locations are overridable via environment or command line, e.g.:
-#   make CROSS_PREFIX=/opt/axiome/cross/bin CC=...
+#   make CROSS_PREFIX=/opt/axiome/cross/bin
+#   make CC=/path/to/x86_64-elf-gcc LD=/path/to/x86_64-elf-ld   (command line only)
 #   make OVMF=/path/to/OVMF.fd EFI_PREFIX=/usr SUDO=
-PYTHON      ?= python3
-HOSTCC      ?= gcc
+PYTHON       ?= python3
+# Host toolchain for the native unit tests. `cc`/`c++` resolve to the system
+# compiler everywhere (gcc on Linux, clang on macOS, the nix stdenv wrappers
+# inside `nix develop`); bare gcc is not present in every environment.
+HOSTCC       ?= cc
+HOSTCXX      ?= c++
+CROSS_TRIPLE ?= x86_64-elf
 CROSS_PREFIX ?= $(HOME)/opt/cross/bin
-OVMF        ?= /usr/share/ovmf/OVMF.fd
-SUDO        ?= sudo
+# OVMF_FD is exported by the nix dev shell (flake.nix).
+OVMF         ?= $(if $(OVMF_FD),$(OVMF_FD),/usr/share/ovmf/OVMF.fd)
+SUDO         ?= sudo
 
-# Cross-compiler for building kernel + userspace (freestanding axiome ELFs)
-CC      ?= $(CROSS_PREFIX)/x86_64-elf-gcc
-CXX     ?= $(CROSS_PREFIX)/x86_64-elf-g++
-AS      ?= $(CROSS_PREFIX)/x86_64-elf-as
-LD      ?= $(CROSS_PREFIX)/x86_64-elf-ld
+# The edk2 code image shipped with qemu on macOS is a split firmware that
+# `-bios` refuses to load ("could not load PC BIOS"); it has to be exposed as
+# a (read-only) pflash device. Linux's combined OVMF.fd works with -bios.
+ifeq ($(shell uname -s),Darwin)
+OVMF_ARGS    := -drive if=pflash,format=raw,readonly=on,file=$(OVMF)
+else
+OVMF_ARGS    := -bios $(OVMF)
+endif
+
+# Use the cross toolchain from PATH if there is one (nix dev shell),
+# otherwise fall back to CROSS_PREFIX.
+ifeq ($(shell command -v $(CROSS_TRIPLE)-gcc 2>/dev/null),)
+CROSS_BIN := $(CROSS_PREFIX)/
+endif
+
+# Cross-compiler for building kernel + userspace (freestanding axiome ELFs).
+#
+# Do NOT use ?= for these: make predefines CC=cc, CXX=g++, AS=as, LD=ld and
+# nix's stdenv exports CC/CXX/AS/LD too, so ?= silently kept the host tools
+# (on macOS: Apple's ld, which has no -shared). Only a command-line override
+# (make CC=...) replaces the cross tools.
+ifeq ($(filter command line override,$(origin CC)),)
+CC  := $(CROSS_BIN)$(CROSS_TRIPLE)-gcc
+endif
+ifeq ($(filter command line override,$(origin CXX)),)
+CXX := $(CROSS_BIN)$(CROSS_TRIPLE)-g++
+endif
+ifeq ($(filter command line override,$(origin AS)),)
+AS  := $(CROSS_BIN)$(CROSS_TRIPLE)-as
+endif
+ifeq ($(filter command line override,$(origin LD)),)
+LD  := $(CROSS_BIN)$(CROSS_TRIPLE)-ld
+endif
+# Hand the cross tools to the kernel/ and bootloader/ sub-makes.
+export CC CXX AS LD
 
 DEV ?= /dev/sdx
 
@@ -24,11 +61,18 @@ DEV ?= /dev/sdx
 #   make run-2d                # sdl + virtio-vga (no virgl, no gl)
 #   make run QEMU_DISPLAY=sdl QEMU_GPU_DEVICE=virtio-vga
 # For Venus/GFXStream (blob): make run QEMU_GPU_DEVICE="virtio-gpu-gl-pci,hostmem=4G,blob=true"
-QEMU_DISPLAY ?= sdl,gl=on
+# macOS has no virglrenderer, so it defaults to Cocoa + plain virtio-vga.
+ifeq ($(shell uname -s),Darwin)
+QEMU_DISPLAY    ?= cocoa
+QEMU_GPU_DEVICE ?= virtio-vga
+QEMU_DISPLAY_2D ?= cocoa
+else
+QEMU_DISPLAY    ?= sdl,gl=on
 QEMU_GPU_DEVICE ?= virtio-vga-gl
+QEMU_DISPLAY_2D ?= sdl
+endif
 # Linux-like aliases: discrete vs integrated VGA variant
 QEMU_GPU_2D ?= virtio-vga
-QEMU_DISPLAY_2D ?= sdl
 
 # Partition geometry (must stay in sync with tools/mkpart.py).
 BOOT_PART_LBA     := 2048
@@ -202,7 +246,7 @@ disk.img: $(DISK_PATH)
 # Default boot: the axboot UEFI loader on disk.img, straight into OVMF.
 # No CD-ROM needed. `run-iso` keeps the ISO path for hardware testing.
 run: disk.img
-	qemu-system-x86_64 -bios $(OVMF) \
+	qemu-system-x86_64 $(OVMF_ARGS) \
 		-drive file=$(BUILD_DIR)/disk.img,format=raw,if=ide,index=0,media=disk \
 		-m 512M -serial stdio -display $(QEMU_DISPLAY) \
 		-device $(QEMU_GPU_DEVICE) \
@@ -211,7 +255,7 @@ run: disk.img
 
 # Linux-like 2D fallback (no virgl, like DRM_VIRTIO_GPU_KMS=n or VIRGL not offered)
 run-2d: disk.img
-	qemu-system-x86_64 -bios $(OVMF) \
+	qemu-system-x86_64 $(OVMF_ARGS) \
 		-drive file=$(BUILD_DIR)/disk.img,format=raw,if=ide,index=0,media=disk \
 		-m 512M -serial stdio -display $(QEMU_DISPLAY_2D) \
 		-device $(QEMU_GPU_2D) \
@@ -224,7 +268,7 @@ run-3d: run
 # Venus/GFXStream blob path (Linux virtio_gpu_object.c blob + host_visible_mm)
 # Requires QEMU 6.0+ with -object memory-backend-memfd and hostmem
 run-venus: disk.img
-	qemu-system-x86_64 -bios $(OVMF) \
+	qemu-system-x86_64 $(OVMF_ARGS) \
 		-drive file=$(BUILD_DIR)/disk.img,format=raw,if=ide,index=0,media=disk \
 		-m 512M -serial stdio -display sdl,gl=on \
 		-device virtio-gpu-gl-pci,hostmem=4G,blob=true,venus=true \
@@ -232,7 +276,7 @@ run-venus: disk.img
 		-device virtio-net-pci,netdev=net0
 
 run-iso: iso disk.img
-	qemu-system-x86_64 -bios $(OVMF) \
+	qemu-system-x86_64 $(OVMF_ARGS) \
 		-cdrom $(BUILD_DIR)/axiome.iso \
 		-drive file=$(BUILD_DIR)/disk.img,format=raw,if=ide,index=0,media=disk \
 		-m 512M -serial stdio -display $(QEMU_DISPLAY) \
@@ -241,12 +285,12 @@ run-iso: iso disk.img
 		-device virtio-net-pci,netdev=net0
 
 run-fb: disk.img
-	qemu-system-x86_64 -bios $(OVMF) \
+	qemu-system-x86_64 $(OVMF_ARGS) \
 		-drive file=$(BUILD_DIR)/disk.img,format=raw,if=ide,index=0,media=disk \
 		-m 512M -serial stdio -display $(QEMU_DISPLAY) -device $(QEMU_GPU_DEVICE)
 
 run-usb: disk.img
-	qemu-system-x86_64 -bios $(OVMF) \
+	qemu-system-x86_64 $(OVMF_ARGS) \
 		-drive file=$(BUILD_DIR)/disk.img,format=raw,if=ide,index=0,media=disk \
 		-m 512M -serial stdio -display $(QEMU_DISPLAY) \
 		-device $(QEMU_GPU_DEVICE) \
@@ -260,9 +304,18 @@ run-usb: disk.img
 # (never copies of them) against the host toolchain and runs as a native
 # binary, so pure-logic units are exercised without booting the OS.
 # ---------------------------------------------------------------------------
+# The libc tests deliberately compare pointers returned by str*/mem* against
+# the addresses of string literals, which clang diagnoses as
+# -Wstring-compare / -Wstring-plus-int. GCC ignores these flags.
 TEST_CFLAGS := -std=c11 -O2 -Wall -Wextra -Werror -fno-builtin
+TEST_CFLAGS += -Wno-string-compare -Wno-string-plus-int
+# macOS marks sprintf deprecated, but libc_stdio_test exercises it on purpose.
+TEST_CFLAGS += -Wno-deprecated-declarations
 KERNEL_INC  := -I$(REPO_ROOT)/kernel
-LIBC_INC    := -I$(REPO_ROOT)/userspace/libc
+# Prefer the freestanding headers only for quoted includes. Angle includes
+# (<stdio.h> in test_util.h) keep using the host headers, so
+# fprintf(stderr, ...) binds to the host libc instead of the axiome FILE.
+LIBC_INC    := -iquote $(REPO_ROOT)/userspace/libc
 LIBC_STUBS  := tests/libc_stubs_host.c
 
 KERNEL_TESTS := \
@@ -290,9 +343,10 @@ $(BUILD_DIR)/tests/hid_boot_test: tests/hid_boot_test.c kernel/hid_boot.c
 	@mkdir -p $(@D)
 	$(HOSTCC) $(TEST_CFLAGS) $(KERNEL_INC) -o $@ $^
 
+# Native (host) C++ binary: must use HOSTCXX, not the cross CXX.
 $(BUILD_DIR)/tests/gfx_clip_test: tests/gfx_clip_test.c kernel/gfx/gfx_types.h
 	@mkdir -p $(@D)
-	$(CXX) -std=c++17 -O2 -Wall -Wextra -Werror -fno-builtin $(KERNEL_INC) -o $@ $<
+	$(HOSTCXX) -x c++ -std=c++17 -O2 -Wall -Wextra -Werror -fno-builtin $(KERNEL_INC) -o $@ $<
 
 $(BUILD_DIR)/tests/input_abi_test: tests/input_abi_test.c kernel/input_abi.h
 	@mkdir -p $(@D)
@@ -314,21 +368,28 @@ $(BUILD_DIR)/tests/kernel_layout_test: tests/kernel_layout_test.c kernel/elf.h k
 	@mkdir -p $(@D)
 	$(HOSTCC) $(TEST_CFLAGS) $(KERNEL_INC) -o $@ $<
 
-# Dynamic-linker regression: build a real PIE executable + shared library with
-# the host toolchain, then run kernel/dynlink.c against them (raw buffers,
-# load bias 0, no execution - the same contract as the in-kernel loader).
-# -nostdlib keeps the images free of libc runtime dependencies (crt, gcc
-# support libs, __gmon_start__...) that no axiome binary ever has.
-$(BUILD_DIR)/tests/dynlink_fixture_lib.sl: tests/dynlink_fixture_lib.c
+# Dynamic-linker regression: build a real PIE executable + shared library, then
+# run kernel/dynlink.c against them (raw buffers, load bias 0, no execution -
+# the same contract as the in-kernel loader). The fixtures are only *parsed*,
+# never executed, so they are built with the cross compiler. That keeps them
+# ELF even when the host compiler emits Mach-O (macOS), and -nostdlib keeps
+# them free of libc runtime dependencies (crt, gcc support libs,
+# __gmon_start__...) that no axiome binary ever has.
+$(BUILD_DIR)/tests/dynlink_fixture_lib.o: tests/dynlink_fixture_lib.c
 	@mkdir -p $(@D)
-	$(HOSTCC) $(TEST_CFLAGS) -fPIC -shared -nostdlib \
-		-Wl,-soname,dynlink_fixture_lib.sl -o $@ $<
+	$(CC) $(TEST_CFLAGS) -fPIC -c -o $@ $<
 
-$(BUILD_DIR)/tests/dynlink_fixture_app: tests/dynlink_fixture_app.c \
-		$(BUILD_DIR)/tests/dynlink_fixture_lib.sl
+$(BUILD_DIR)/tests/dynlink_fixture_lib.sl: $(BUILD_DIR)/tests/dynlink_fixture_lib.o
+	$(LD) -shared -soname dynlink_fixture_lib.sl -o $@ $<
+
+$(BUILD_DIR)/tests/dynlink_fixture_app.o: tests/dynlink_fixture_app.c
 	@mkdir -p $(@D)
-	$(HOSTCC) $(TEST_CFLAGS) -fPIC -pie -nostdlib -Wl,--hash-style=sysv \
-		-Wl,-e,main -o $@ $< $(BUILD_DIR)/tests/dynlink_fixture_lib.sl
+	$(CC) $(TEST_CFLAGS) -fPIC -c -o $@ $<
+
+$(BUILD_DIR)/tests/dynlink_fixture_app: $(BUILD_DIR)/tests/dynlink_fixture_app.o \
+		$(BUILD_DIR)/tests/dynlink_fixture_lib.sl
+	$(LD) -pie -e main --hash-style=sysv -o $@ $< \
+		$(BUILD_DIR)/tests/dynlink_fixture_lib.sl
 
 $(BUILD_DIR)/tests/dynlink_regress_test: tests/dynlink_regress_test.c kernel/dynlink.c \
 		$(BUILD_DIR)/tests/dynlink_fixture_app $(BUILD_DIR)/tests/dynlink_fixture_lib.sl
@@ -360,7 +421,7 @@ test-hid: $(BUILD_DIR)/tests/hid_boot_test
 	$(BUILD_DIR)/tests/hid_boot_test
 
 debug: disk.img
-	qemu-system-x86_64 -bios $(OVMF) \
+	qemu-system-x86_64 $(OVMF_ARGS) \
 		-drive file=$(BUILD_DIR)/disk.img,format=raw,if=ide,index=0,media=disk \
 		-m 512M -serial stdio -display $(QEMU_DISPLAY) -device $(QEMU_GPU_DEVICE) -s -S
 

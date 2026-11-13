@@ -6,15 +6,23 @@
 typedef long time_t;
 typedef long suseconds_t;
 
+/* A host build (the libc unit tests compile this header with the system
+   preprocessor) may already have pulled in the platform's definitions via
+   <sys/types.h>. Those guards are BSD/macOS spellings; they are never set in
+   the freestanding build, where the definitions below are required. */
+#ifndef _STRUCT_TIMEVAL
 struct timeval {
     time_t tv_sec;
     suseconds_t tv_usec;
 };
+#endif
 
+#ifndef _STRUCT_TIMESPEC
 struct timespec {
     time_t tv_sec;
     long tv_nsec;
 };
+#endif
 
 struct tm {
     int tm_sec;

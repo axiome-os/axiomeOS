@@ -118,6 +118,15 @@ void axw_keyboard_destroy(struct axw_keyboard *k);
    events processed, or -1 on error. */
 int axw_dispatch(struct axw_display *d);
 
+/* Install the raw event handler invoked for every dispatched message.
+   The handler receives the display, the sender object id, the opcode and
+   the message arguments. */
+void axw_display_set_event_handler(struct axw_display *d,
+                                   int (*handler)(struct axw_display *,
+                                                  uint32_t, uint16_t,
+                                                  const uint32_t *, int),
+                                   void *data);
+
 /* ---- callback ---- */
 
 struct axw_callback *axw_display_frame(struct axw_display *d);
