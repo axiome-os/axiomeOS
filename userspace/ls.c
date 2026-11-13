@@ -1,4 +1,5 @@
 #include "stdio.h"
+#include "stdlib.h"
 #include "syscall.h"
 #include "string.h"
 #include "errno.h"
@@ -28,16 +29,16 @@ static void usage(void)
     puts("      --help         display this help and exit");
 }
 
-static void sort_ents(struct vfs_dirent *e, int n)
+static void sort_ents(struct vfs_dirent *e, int *idx, int n)
 {
     for (int i = 1; i < n; i++)
     {
         int j = i;
-        while (j > 0 && strcmp(e[j - 1].name, e[j].name) > 0)
+        while (j > 0 && strcmp(e[idx[j - 1]].name, e[idx[j]].name) > 0)
         {
-            struct vfs_dirent t = e[j - 1];
-            e[j - 1] = e[j];
-            e[j] = t;
+            int t = idx[j - 1];
+            idx[j - 1] = idx[j];
+            idx[j] = t;
             j--;
         }
     }
@@ -49,31 +50,44 @@ static int is_dot(const char *n)
            (n[0] == '.' && n[1] == '.' && n[2] == 0);
 }
 
-static void reverse_ents(struct vfs_dirent *e, int n)
+static void reverse_ents(int *idx, int n)
 {
     for (int i = 0, j = n - 1; i < j; i++, j--)
     {
-        struct vfs_dirent t = e[i];
-        e[i] = e[j];
-        e[j] = t;
+        int t = idx[i];
+        idx[i] = idx[j];
+        idx[j] = t;
     }
 }
 
 /* List one directory (assumed to exist). */
 static int list_dir(const char *path, const struct opts *o)
 {
-    struct vfs_dirent all[MAX_E];
+    /* Keep the large entry buffers off the stack: a struct vfs_dirent is
+       ~257 bytes, so MAX_E of them is >256 KiB, and recursive listings would
+       overflow the user stack after a couple of levels. */
+    struct vfs_dirent *all = malloc(sizeof(*all) * MAX_E);
+    int *shown = malloc(sizeof(*shown) * MAX_E);
+    if (!all || !shown)
+    {
+        free(all);
+        free(shown);
+        fprintf(stderr, "ls: cannot access '%s': %s\n",
+                path, ax_strerror(ENOMEM));
+        return 1;
+    }
     int n = readdir(path, all, MAX_E);
     if (n < 0)
     {
         fprintf(stderr, "ls: cannot access '%s': %s\n",
                 path, ax_strerror(errno));
+        free(all);
+        free(shown);
         return 1;
     }
     if (n > MAX_E)
         n = MAX_E;
 
-    struct vfs_dirent shown[MAX_E];
     int ns = 0;
     for (int i = 0; i < n; i++)
     {
@@ -81,27 +95,27 @@ static int list_dir(const char *path, const struct opts *o)
         if (is_dot(nm))
         {
             if (o->all)
-                shown[ns++] = all[i];
+                shown[ns++] = i;
         }
         else if (nm[0] == '.')
         {
             if (o->all || o->almost)
-                shown[ns++] = all[i];
+                shown[ns++] = i;
         }
         else
         {
-            shown[ns++] = all[i];
+            shown[ns++] = i;
         }
     }
 
-    sort_ents(shown, ns);
+    sort_ents(all, shown, ns);
     if (o->reverse)
         reverse_ents(shown, ns);
 
     int st = 0;
     for (int i = 0; i < ns; i++)
     {
-        const char *nm = shown[i].name;
+        const char *nm = all[shown[i]].name;
         if (o->longfmt)
         {
             char full[512];
@@ -129,15 +143,18 @@ static int list_dir(const char *path, const struct opts *o)
     {
         for (int i = 0; i < ns; i++)
         {
-            if (shown[i].type != DT_DIR || is_dot(shown[i].name))
+            const struct vfs_dirent *e = &all[shown[i]];
+            if (e->type != DT_DIR || is_dot(e->name))
                 continue;
             char full[512];
-            ax_join_path(path, shown[i].name, full, sizeof(full));
+            ax_join_path(path, e->name, full, sizeof(full));
             printf("\n%s:\n", full);
-            if (list_dir(full, o) < 0)
+            if (list_dir(full, o) != 0)
                 st = 1;
         }
     }
+    free(all);
+    free(shown);
     return st;
 }
 
@@ -247,7 +264,7 @@ int main(int argc, char **argv)
     /* File operands first, as plain listings (no headers). */
     for (int i = 0; i < nops; i++)
         if (!isdir[i])
-            if (show_one(ops[i], &o) < 0)
+            if (show_one(ops[i], &o) != 0)
                 st = 1;
 
     /* Then directory operands, with headers when more than one. */
@@ -262,7 +279,7 @@ int main(int argc, char **argv)
                 printf("\n");
             printf("%s:\n", ops[i]);
         }
-        if (list_dir(ops[i], &o) < 0)
+        if (list_dir(ops[i], &o) != 0)
             st = 1;
         hdrs++;
     }
