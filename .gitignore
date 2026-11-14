@@ -20,3 +20,5 @@ DOCS/NESTED.TXT
 
 # Reference material
 osdev_wiki/
+
+include/bootsplash_assets.h

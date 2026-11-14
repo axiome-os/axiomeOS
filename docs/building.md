@@ -100,6 +100,22 @@ make run-fb
 
 ---
 
+## Boot Splash and Debug Logs
+
+The logo + rounded progress-bar splash and the framebuffer debug-log switch are
+controlled by `config/axboot.cfg`, which is copied into the boot partition as
+`\axboot.cfg`:
+
+```ini
+debug=0   # 1 = show kernel logs on the framebuffer
+splash=1  # 0 = disable the graphical boot splash
+```
+
+After editing it, rebuild the image with `make disk.img`. See
+[boot-splash.md](boot-splash.md) for details.
+
+---
+
 # Debugging
 
 Start QEMU waiting for GDB:

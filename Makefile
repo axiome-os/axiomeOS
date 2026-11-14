@@ -94,15 +94,21 @@ DISK_PATH := $(BUILD_DIR)/disk.img
 # of them changes (a userspace .elf or a .kxt), the ROOT partition rebuilds.
 MANIFEST_BINS := $(shell sed -n 's/.*[[:space:]]bin:\([^[:space:]]*\).*/\1/p' root_manifest.txt)
 
-.PHONY: all kernel bootloader userspace iso run run-2d run-3d run-venus run-iso run-fb run-usb debug test test-hid clean distclean install disk.img
+.PHONY: all kernel bootloader userspace iso run run-2d run-3d run-venus run-iso run-fb run-usb debug test test-hid clean distclean install disk.img assets
 
 all: iso
 
-kernel: userspace
-	$(MAKE) -C kernel BUILD_DIR=$(BUILD_DIR)/kernel
+KERNEL_ELF     := $(BUILD_DIR)/kernel/kernel.elf
+BOOTLOADER_EFI := $(BUILD_DIR)/bootloader/BOOTX64.EFI
 
-bootloader:
-	$(MAKE) -C bootloader
+kernel: $(KERNEL_ELF)
+
+bootloader: $(BOOTLOADER_EFI)
+
+# The sub-makes own dependency tracking; the top level only needs to run them
+# before anything compares their outputs (the ESP image, the disk image).
+$(KERNEL_ELF): userspace include/bootsplash_assets.h
+	$(MAKE) -C kernel BUILD_DIR=$(BUILD_DIR)/kernel
 
 # Userspace build variables (defined before the target so prerequisites expand at parse time)
 USER_PROGS := init hello cat echo sh ls mkdir cp mv rm touch whoami uname \
@@ -164,12 +170,13 @@ $(BUILD_DIR)/kernel/mkfs_axiomefs: tools/mkfs_axiomefs.c
 	@mkdir -p $(dir $@)
 	$(HOSTCC) -O2 -Wall -I $(REPO_ROOT) -o $@ $<
 
-# The UEFI loader binary. Forward to the bootloader sub-make when it is
-# missing or its sources changed.
-$(BUILD_DIR)/bootloader/BOOTX64.EFI: $(wildcard bootloader/*.c bootloader/*.h bootloader/Makefile include/axboot.h)
+# The UEFI loader binary. Rebuilt by the bootloader sub-make when any of its
+# sources or the shared splash headers change.
+$(BOOTLOADER_EFI): $(wildcard bootloader/*.c bootloader/*.h bootloader/Makefile include/axboot.h) \
+		include/bootsplash.h include/bootsplash_assets.h
 	$(MAKE) -C bootloader
 
-iso: kernel bootloader $(BOOT_FAT)
+iso: $(BOOT_FAT)
 	rm -rf $(BUILD_DIR)/isowork
 	mkdir -p $(BUILD_DIR)/isowork
 	cp $(BOOT_FAT) $(BUILD_DIR)/isowork/esp.img
@@ -179,12 +186,13 @@ iso: kernel bootloader $(BOOT_FAT)
 # BOOT partition: a FAT32 ESP image holding the UEFI bootloader and the
 # kernel. Rebuilt when either of them changes. The bootloader reads
 # \kernel.elf from the volume root via SimpleFileSystem.
-$(BOOT_FAT): $(BUILD_DIR)/kernel/kernel.elf $(BUILD_DIR)/bootloader/BOOTX64.EFI
+$(BOOT_FAT): $(BUILD_DIR)/kernel/kernel.elf $(BUILD_DIR)/bootloader/BOOTX64.EFI config/axboot.cfg
 	@mkdir -p $(dir $@)
 	rm -f $@
 	dd if=/dev/zero of=$@ bs=512 count=$(BOOT_PART_SECTORS) 2>/dev/null
 	mformat -F -i $@ -v BOOT ::
 	mcopy -i $@ $(BUILD_DIR)/kernel/kernel.elf ::kernel.elf
+	mcopy -i $@ config/axboot.cfg ::axboot.cfg
 	mmd -i $@ ::EFI ::EFI/BOOT
 	mcopy -i $@ $(BUILD_DIR)/bootloader/BOOTX64.EFI ::EFI/BOOT/BOOTX64.EFI
 
@@ -211,7 +219,7 @@ $(ROOT_AXFS): $(BUILD_DIR)/kernel/mkfs_axiomefs root_manifest.txt $(MANIFEST_BIN
 # stamps, so a missed overlay self-heals on the next build.
 BOOT_STAMP := $(BUILD_DIR)/.stamp-boot
 ROOT_STAMP := $(BUILD_DIR)/.stamp-root
-$(DISK_PATH): kernel bootloader $(BUILD_DIR)/kernel/mkfs_axiomefs $(BOOT_FAT) $(ROOT_AXFS) tools/mkpart.py
+$(DISK_PATH): $(BUILD_DIR)/kernel/mkfs_axiomefs $(BOOT_FAT) $(ROOT_AXFS) tools/mkpart.py
 	@mkdir -p $(BUILD_DIR)
 	@target=$(DISK_PATH); \
 		if [ ! -f "$$target" ] || find tools/mkpart.py -newer "$$target" >/dev/null 2>&1; then \
@@ -239,6 +247,13 @@ $(DISK_PATH): kernel bootloader $(BUILD_DIR)/kernel/mkfs_axiomefs $(BOOT_FAT) $(
 		touch "$(ROOT_STAMP)"; \
 	fi; \
 	touch "$$target"
+
+# Regenerate the embedded bootsplash masks from resources/ (checked in, so a
+# normal build does not need to run this).
+include/bootsplash_assets.h: resources/axiome.svg tools/mkbootassets.py
+	$(PYTHON) tools/mkbootassets.py
+
+assets: include/bootsplash_assets.h
 
 # Convenience alias so `make disk.img` / `make run` / `make install` work.
 disk.img: $(DISK_PATH)

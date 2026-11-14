@@ -14,4 +14,5 @@ a simple, lightweight operating system
 
 - [Building the Toolchain](docs/toolchain.md) — install the required dependencies, build the `x86_64-elf` cross-compiler, and set up QEMU.
 - [Building axiomeOS](docs/building.md)
+- [Boot splash and debug mode](docs/boot-splash.md) — logo/progress-bar configuration and `debug=1` framebuffer logs.
 - [axmui — native HTML+CSS UI toolkit](docs/axmui.md) — the de-facto GUI library for all built-in desktop apps (no WebKit, pure native raster).
