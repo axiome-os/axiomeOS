@@ -20,7 +20,6 @@ int main(void)
     assert(VIRTIO_PCI_DEV_FEATURE == 0x34);
     assert(VIRTIO_PCI_DRV_FEATURE == 0x3C);
     assert(VIRTIO_PCI_QUEUE_SEL == 0x70);
-    assert(VIRTIO_PCI_QUEUE_PFN == 0x78);
 
     /* Virtio status bits. */
     assert(VIRTIO_STATUS_ACK == (1U << 0));
@@ -39,10 +38,10 @@ int main(void)
     assert(VIRTIO_GPU_CMD_RESOURCE_CREATE_2D == 0x0101);
     assert(VIRTIO_GPU_CMD_RESOURCE_UNREF == 0x0102);
     assert(VIRTIO_GPU_CMD_SET_SCANOUT == 0x0103);
-    assert(VIRTIO_GPU_CMD_RESOURCE_FLUSH == 0x0105);
-    assert(VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D == 0x0107);
-    assert(VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING == 0x0108);
-    assert(VIRTIO_GPU_CMD_RESOURCE_DETACH_BACKING == 0x0109);
+    assert(VIRTIO_GPU_CMD_RESOURCE_FLUSH == 0x0104);
+    assert(VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D == 0x0105);
+    assert(VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING == 0x0106);
+    assert(VIRTIO_GPU_CMD_RESOURCE_DETACH_BACKING == 0x0107);
     assert(VIRTIO_GPU_CMD_CTX_CREATE == 0x0200);
     assert(VIRTIO_GPU_CMD_SUBMIT_3D == 0x0207);
     assert(VIRTIO_GPU_CMD_UPDATE_CURSOR == 0x0300);
@@ -157,8 +156,8 @@ int main(void)
     assert(VIRTIO_GPU_FORMAT_A8R8G8B8_UNORM == 3);
     assert(VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM == 1);
 
-    /* Device config struct packing. */
-    assert(sizeof(struct virtio_gpu_config) == 20);
+    /* Device config struct packing (no blob_alignment in the spec). */
+    assert(sizeof(struct virtio_gpu_config) == 16);
 
     /* Driver feature bits. */
     assert((1U << VIRTIO_GPU_F_RESOURCE_BLOB) == (1U << 3));
