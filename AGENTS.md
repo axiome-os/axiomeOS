@@ -80,8 +80,7 @@ Trust the tree over `docs/structure.md` when they disagree.
 - `include/` — shared headers (boot protocol, splash assets)
 - `config/axboot.cfg` — `debug=` and `splash=`; copied into the boot partition
 - `tools/` — image and manifest helpers
-- `ports/mesa/` — upstream Mesa checkout. Read `ports/mesa/AGENTS.md` before touching it
-- `ports/mesa-axiome/` — axiomeOS's Mesa port
+- `ports/aluminium/` — axiomeOS's graphics API (Metal alternative). See `ports/aluminium/README.md`
 - `docs/conventions.md` — coding style; follow it
 
 ## Language rules
@@ -94,9 +93,8 @@ Trust the tree over `docs/structure.md` when they disagree.
 
 ## Third-party trees
 
-`ports/mesa` is upstream Mesa, not axiomeOS code. Do not open merge requests or
-comments against Mesa's GitLab. Some Mesa subtrees forbid AI changes; the list
-is in `ports/mesa/AGENTS.md`. Port work belongs in `ports/mesa-axiome/` and
-`docs/mesa-port.md`.
+`ports/aluminium` is axiomeOS's own graphics API. Do not confuse it with
+upstream projects — it is developed in-tree as a git submodule at
+`https://github.com/axiome-os/aluminium.git`.
 
 Clone with submodules: `git clone --recurse-submodules`.

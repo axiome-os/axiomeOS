@@ -120,7 +120,7 @@ USER_ELFS := $(addprefix userspace/,$(addsuffix .elf,$(USER_PROGS)))
 USER_BASE_CFLAGS := -ffreestanding -nostdlib -nostartfiles -fno-builtin \
 	-fno-stack-protector -fPIC -mcmodel=small -O2 -g -pipe \
 	-mno-red-zone -Wall -Wextra -I userspace -I userspace/libc -I userspace/libaxw \
-	-I$(REPO_ROOT)/kernel
+	-I userspace/libaluminium -I ports/aluminium/include -I$(REPO_ROOT)/kernel
 USER_CFLAGS := $(USER_BASE_CFLAGS) -fpie
 
 LIBC_CFLAGS := $(USER_BASE_CFLAGS)
@@ -134,9 +134,24 @@ LIBC_SRCS := userspace/libc/errno.c userspace/libc/string.c \
 LIBC_OBJS := $(patsubst userspace/libc/%.c, $(BUILD_DIR)/libc_%.o, $(LIBC_SRCS))
 LIBC_SL := userspace/libc.sl
 
+LIB_ALUMINIUM_OBJS := \
+	$(BUILD_DIR)/libaluminium_aluminium.o \
+	$(BUILD_DIR)/libaluminium_core.o \
+	$(BUILD_DIR)/libaluminium_backend.o \
+	$(BUILD_DIR)/libaluminium_sync.o \
+	$(BUILD_DIR)/libaluminium_ext.o \
+	$(BUILD_DIR)/libaluminium_software.o
+LIB_ALUMINIUM_SL := userspace/libaluminium.sl
+
 LIB_AXW_OBJ := $(BUILD_DIR)/libaxw_axw-client.o
 
-userspace: $(USER_ELFS) $(LIBC_SL)
+USER_BASE_CFLAGS := -ffreestanding -nostdlib -nostartfiles -fno-builtin \
+	-fno-stack-protector -fPIC -mcmodel=small -O2 -g -pipe \
+	-mno-red-zone -Wall -Wextra -I userspace -I userspace/libc -I userspace/libaxw \
+	-I userspace/libaluminium -I ports/aluminium/include -I$(REPO_ROOT)/kernel
+USER_CFLAGS := $(USER_BASE_CFLAGS) -fpie
+
+userspace: $(USER_ELFS) $(LIBC_SL) $(LIB_ALUMINIUM_SL)
 	@:
 
 $(BUILD_DIR)/user_crt0.o: userspace/libc/crt0.c
@@ -156,7 +171,38 @@ $(LIBC_SL): $(LIBC_OBJS) userspace/libc.ld
 	$(LD) -shared -T userspace/libc.ld --hash-style=sysv \
 		-soname libc.sl -z max-page-size=0x1000 -o $@ $(LIBC_OBJS)
 
-userspace/%.elf: $(BUILD_DIR)/%_user.o $(CRT0_OBJ) $(LIBC_SL) $(LIB_AXW_OBJ)
+$(BUILD_DIR)/libaluminium_aluminium.o: userspace/libaluminium/aluminium.c
+	@mkdir -p $(@D)
+	$(CC) $(LIBC_CFLAGS) -c $< -o $@
+
+ALUMINIUM_INC := -I ports/aluminium/include -I ports/aluminium/include/aluminium -I ports/aluminium/src
+
+$(BUILD_DIR)/libaluminium_core.o: ports/aluminium/src/core.c
+	@mkdir -p $(@D)
+	$(CC) $(LIBC_CFLAGS) $(ALUMINIUM_INC) -c $< -o $@
+
+$(BUILD_DIR)/libaluminium_backend.o: ports/aluminium/src/backend.c
+	@mkdir -p $(@D)
+	$(CC) $(LIBC_CFLAGS) $(ALUMINIUM_INC) -c $< -o $@
+
+$(BUILD_DIR)/libaluminium_sync.o: ports/aluminium/src/sync.c
+	@mkdir -p $(@D)
+	$(CC) $(LIBC_CFLAGS) $(ALUMINIUM_INC) -c $< -o $@
+
+$(BUILD_DIR)/libaluminium_ext.o: ports/aluminium/src/ext.c
+	@mkdir -p $(@D)
+	$(CC) $(LIBC_CFLAGS) $(ALUMINIUM_INC) -c $< -o $@
+
+$(BUILD_DIR)/libaluminium_software.o: ports/aluminium/backends/software/aluminium_software.c
+	@mkdir -p $(@D)
+	$(CC) $(LIBC_CFLAGS) $(ALUMINIUM_INC) -c $< -o $@
+
+$(LIB_ALUMINIUM_SL): $(LIB_ALUMINIUM_OBJS) userspace/libc.ld
+	@mkdir -p $(@D)
+	$(LD) -shared -T userspace/libc.ld --hash-style=sysv \
+		-soname libaluminium.sl -z max-page-size=0x1000 -o $@ $(LIB_ALUMINIUM_OBJS)
+
+userspace/%.elf: $(BUILD_DIR)/%_user.o $(CRT0_OBJ) $(LIBC_SL) $(LIB_ALUMINIUM_SL) $(LIB_AXW_OBJ)
 	@mkdir -p $(@D)
 	$(LD) -pie -T userspace/link.ld --hash-style=sysv \
 		-z max-page-size=0x1000 -e _start -o $@ $^

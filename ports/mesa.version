@@ -1,3 +1,0 @@
-mesa-26.2.1 / da14d65e
-upstream: https://gitlab.freedesktop.org/mesa/mesa.git
-shallow: --depth 1, detached tag checkout (no branch tracking)

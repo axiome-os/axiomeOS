@@ -53,7 +53,7 @@ Wire format: `u32 sender_id, u16 opcode, u16 size, u32 args[]` over `/devices/ax
 
 - `kernel/dri.c` write-command path is now the DRM core (`drm_sys_write` handles `struct drm_cmd`)
 - `kernel/axdri_cmd.h` → `kernel/drm/drm_ioctl.h` (old header kept for `gfx_test` compat)
-- `kernel/gfx/mesa_abi.h` → superseded by `drm_ioctl.h`
+- `kernel/gfx/aluminium_abi.h` → Aluminium ABI header (replaces `mesa_abi.h`)
 - `userspace/guixd.c`, `userspace/compositor.h`, `userspace/axclient.h`, `kernel/wm_abi.h` — legacy SHM seqlock protocol, still present but superseded by axw protocol
 
 ## What stays (by design)

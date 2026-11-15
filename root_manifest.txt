@@ -74,6 +74,7 @@ Binaries/axoobe             0755  0  0  f  bin:userspace/axoobe.elf
 # DT_NEEDED entry (see kernel/dynlink.c search paths). Libraries live under
 # /Libraries (the /Binaries layout used to hold it).
 Libraries/libc.sl    0755  0  0  f  bin:userspace/libc.sl
+Libraries/libaluminium.sl  0755  0  0  f  bin:userspace/libaluminium.sl
 
 # Loadable kernel modules (.kxt). Built by kernel/modules/Makefile into the
 # source tree and embedded here so init can load them at boot. (sata/nvme

@@ -71,7 +71,7 @@ Userspace: axw protocol over IPC/socket
 
 **Deleted/deprecated:**
 - `kernel/axdri_cmd.h` — replaced by `drm_ioctl.h`.
-- `kernel/gfx/mesa_abi.h` — replaced by DRM ioctl headers.
+- `kernel/gfx/mesa_abi.h` — removed (replaced by `ports/aluminium/include/aluminium/aluminium.h`).
 
 **IOCTLs (minimal):**
 ```
@@ -154,7 +154,7 @@ Transport: axiome IPC (`SYS_IPC_*`) or unix socket; `/devices/axw-0` or `/run/ax
 
 | Phase | New | Modified | Removed |
 |-------|-----|----------|---------|
-| 1. DRM/KMS/GEM | ~8 (kernel/drm/*) | dri.c, framebuffer.c, gfx/manager.cpp, gfx/gop_display.cpp, syscall.c, syscall_numbers.h | axdri_cmd.h, mesa_abi.h |
+| 1. DRM/KMS/GEM | ~8 (kernel/drm/*) | dri.c, framebuffer.c, gfx/manager.cpp, gfx/gop_display.cpp, syscall.c, syscall_numbers.h | axdri_cmd.h |
 | 2. Protocol | ~4 (libaxw/*) + axdisplay-server.c | wm_abi.h, axgui.h | axclient.h, compositor.h |
 | 3. Compositor | — | axterm/axinfo/axlogin/axoobe, axgui.h | guixd.c, axwm.c |
 | 4. Input | input.c, evdev.c | input.c, keyboard.c, mouse.c, hid_boot.c | — |

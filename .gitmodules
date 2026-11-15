@@ -7,3 +7,6 @@
 [submodule "bootloader"]
 	path = bootloader
 	url = https://github.com/axiome-os/axiomeBootloader.git
+[submodule "ports/aluminium"]
+	path = ports/aluminium
+	url = https://github.com/axiome-os/aluminium.git

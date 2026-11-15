@@ -135,5 +135,5 @@ the same path Gallium `softpipe` would use.
 * `kernel/userspace/axmui/axmui.h` — implementation (search `axmui_`).
 * `kernel/wm_abi.h` — SHM header + `WM_EV_*` ABI.
 * `kernel/userspace/axclient.h` — attach + seqlock helpers.
-* `ports/mesa-axiome/WINSYS.md` — Mesa softpipe transport that will replace
-  the current software `axgui` raster in a future DRI accelerator.
+* `ports/aluminium/README.md` — Aluminium graphics API, replacing the Mesa
+  softpipe transport for GPU-accelerated rendering.
