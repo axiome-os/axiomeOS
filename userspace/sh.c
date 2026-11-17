@@ -443,6 +443,7 @@ static void print_help(void)
     puts("  cd <dir>");
     puts("  pwd");
     puts("  clear");
+    puts("  poweroff");
     puts("");
     puts("External: hello, cat, ls, mkdir, rm, touch, whoami, uname");
     puts("");
@@ -626,6 +627,10 @@ static int run_command(char *cmd)
         do_kill(argc, argv);
     } else if (strcmp(argv[0], "clear") == 0) {
         do_clear();
+    } else if (strcmp(argv[0], "poweroff") == 0) {
+        puts("sh: powering off...");
+        sys_poweroff();
+        puts("sh: poweroff failed");
     } else if (strcmp(argv[0], "export") == 0) {
         if (argc < 2) {
             for (int i = 0; i < var_count; i++)
