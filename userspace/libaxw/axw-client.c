@@ -161,7 +161,9 @@ static struct axw_connection *axw_connection_create(int fd)
     if (!c)
         return 0;
     c->fd = fd;
-    c->next_id = 1;
+    /* Make object ids unique per process so they cannot collide with
+       ids allocated by other clients sharing the server's global tables. */
+    c->next_id = (((uint32_t)sys_getpid() & 0x7FFFu) << 16) | 1u;
     c->event_handler = 0;
     c->handler_data = 0;
     return c;

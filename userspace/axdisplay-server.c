@@ -1106,7 +1106,9 @@ int main(int argc, char **argv)
                         if (f->used && !f->dead)
                         {
                             uint32_t args[3] = { f->id, kc, 0 };
-                            axw_send_event(AXW_ID_SEAT, AXW_KEYBOARD_KEY, args, 2);
+                            /* Send from the surface id so clients can match
+                               the event to their surface (args[0] == surf_id). */
+                            axw_send_event(f->id, AXW_KEYBOARD_KEY, args, 2);
                         }
                     }
                 }

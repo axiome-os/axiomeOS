@@ -944,6 +944,11 @@ static int run_axw_client(const char *initial_cmd, int uid, int gid)
     g_surf = win->surf;
     g_fb = win->fb; /* use axmui's framebuffer for direct drawing */
 
+    /* Size the terminal grid to the surface body. Text is drawn at (8,28),
+       so leave an 8px margin on the right and at the bottom. */
+    term_init(&g_term, (int)(g_fb.w - 16) / FONT_WIDTH,
+              (int)(g_fb.h - 36) / FONT_HEIGHT);
+
     /* Destroy axmui app - we only needed it for surface lifecycle */
     axmui_app_destroy(app);
 
@@ -981,8 +986,7 @@ static int run_axw_client(const char *initial_cmd, int uid, int gid)
     for (;;)
     {
         /* Dispatch axw events (keyboard input, etc.) */
-        int n = axw_dispatch(g_disp);
-        (void)n;
+        axw_dispatch(g_disp);
 
         if (!g_running)
             break;
